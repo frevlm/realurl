@@ -115,10 +115,21 @@ inline BodyFeeder::BodyFeeder(BufferPool *pool)
 inline std::shared_ptr<BodySource> BodyFeeder::make_source()
 {
     auto source = std::make_shared<BodySource>();
-    auto self = shared_from_this();
-    source->read = [self]() { return self->pull(); };
-    source->consume = [self](size_t n) { self->consume(n); };
-    source->peek = [self]() { return self->peek_copy(); };
+    std::weak_ptr<BodyFeeder> weak = weak_from_this();
+    source->read = [weak]() {
+        if (auto self = weak.lock())
+            return self->pull();
+        return BodyReadResult{ {}, true, false };
+    };
+    source->consume = [weak](size_t n) {
+        if (auto self = weak.lock())
+            self->consume(n);
+    };
+    source->peek = [weak]() {
+        if (auto self = weak.lock())
+            return self->peek_copy();
+        return std::string{};
+    };
     source_ = source;
     return source;
 }

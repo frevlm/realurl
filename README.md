@@ -18,6 +18,7 @@ The design is deliberately narrow. realurl does not route, authenticate, bill, o
 | `StreamPumpPool` | `realurl/stream_pump_pool.hpp` | Bounded worker pool with client-IP affinity, plus an asio completion gate |
 | `ClientWriter` | `realurl/fd_writer.hpp` | Deadline-bounded writes to a raw client fd |
 | `ResponseSink` | `realurl/response_sink.hpp` | Server-agnostic response abstraction for non-streaming and chunked responses |
+| `Server` | `realurl/server.hpp` | HTTP/1.1 server with httplib-like routes, buffered or streamed request bodies, and raw response takeover |
 | `BeastResponseSink` | `realurl/beast_response_sink.hpp` | Boost.Beast adapter for `ResponseSink` |
 | `HttplibResponseSink` | `realurl/httplib_response_sink.hpp` | Optional cpp-httplib adapter |
 
@@ -28,7 +29,7 @@ The design is deliberately narrow. realurl does not route, authenticate, bill, o
 - **Bounded upload memory.** `BodyFeeder` keeps at most two 64 KiB chunks in flight; a 500 MB body never exists as a single object.
 - **Four timeout segments.** Connect, upload-stall (low-speed), response-header wait, and inter-event idle are configured independently.
 - **Backpressure is explicit.** The read callback returns `CURL_READFUNC_PAUSE` when the body producer has no data, and the producer wakes the multi handle with `curl_multi_wakeup`.
-- **Server side is pluggable.** `ResponseSink` decouples gateway code from cpp-httplib and Beast.
+- **Server side is pluggable.** `ResponseSink` decouples gateway code from cpp-httplib and Beast, and `realurl::Server` provides an httplib-like routing API with raw streaming takeover.
 
 ## Build
 
@@ -83,6 +84,27 @@ for (;;) {
 stream.stream_close();
 ```
 
+Server:
+
+```cpp
+#include <realurl/server.hpp>
+
+realurl::Server server;
+server.Get("/hello", [](const auto &, auto &res) {
+    res.set_content("world", "text/plain");
+});
+server.Get("/events", [](const auto &, auto &res) {
+    res.take_over([](realurl::ClientWriter &writer) {
+        (void)writer("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                     "Connection: close\r\n\r\n");
+        (void)writer("data: one\n\n");
+    });
+});
+server.listen("0.0.0.0", 8080); // blocks until stop()
+```
+
+See `docs/server.md` for routing, body modes, limits, and `Server::process`.
+
 Uploading a body that is larger than memory:
 
 ```cpp
@@ -108,13 +130,15 @@ request.content_length = declared_length; // -1 when unknown
 
 ## Known limitations
 
-This is version 0.1.1: the code was extracted from revlm without changing behavior. The following defects are known and documented rather than fixed:
+This is version 0.2.0: the transport code was extracted from revlm; the server
+was added afterwards. The following defects are known and documented rather
+than fixed:
 
 1. **`StreamResult` requires an explicit `stream_close()`.** Destroying the result without closing leaves the easy handle attached to the multi handle; the abandon probe reproduces a heap-use-after-free under AddressSanitizer.
-2. **`BodyFeeder` and `BodySource` form a reference cycle.** `make_source()` captures the feeder strongly, so neither object is released until the callbacks are cleared.
-3. **`StreamPumpPool` serializes streams per client IP.** This is intentional for upstream connection reuse, but one client's long streams block its other streams.
-4. **libcurl below 8.4 uses `select()`.** On systems without a poll-based libcurl, the process is limited to `FD_SETSIZE` (1024) descriptors.
-5. **Beast chunked uploads are not covered by the test suite.** The revlm performance report records a 12-second timeout in that path.
+2. **`StreamPumpPool` serializes streams per client IP.** This is intentional for upstream connection reuse, but one client's long streams block its other streams.
+3. **libcurl below 8.4 uses `select()`.** On systems without a poll-based libcurl, the process is limited to `FD_SETSIZE` (1024) descriptors.
+4. **Beast chunked uploads are not covered by the test suite.** The revlm performance report records a 12-second timeout in that path.
+5. **Streamed routes require `Content-Length`.** Chunked request bodies are rejected with 400; only buffered routes decode chunked input.
 
 The probe sources in `probes/` exist so these can be reproduced and fixed in a later version.
 

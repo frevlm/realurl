@@ -27,6 +27,6 @@ Reports whether the `BodyFeeder`/`BodySource` pair is released, and measures
 ./build/probes/realurl_probe_component
 ```
 
-`body_ownership.feeder_expired` and `body_ownership.source_expired` are `false`
-because `BodyFeeder::make_source()` captures a strong reference back to the
-feeder. This is a known limitation, not a regression.
+`body_ownership.feeder_expired` and `body_ownership.source_expired` are both
+`1` since 0.2.0: `BodyFeeder::make_source()` now captures a weak reference, so
+the pair is released when the stream ends. Before 0.2.0 both stayed `0`.

@@ -45,7 +45,7 @@ ClientWriter client_writer_from_fd(int fd, std::chrono::milliseconds timeout,
 {
     return [fd, timeout, response_started = std::move(response_started)](std::string_view data) {
         const bool sent = send_all_fd(fd, data, timeout);
-        if (sent && response_started)
+        if (sent && !data.empty() && response_started)
             response_started->store(true, std::memory_order_release);
         return sent;
     };

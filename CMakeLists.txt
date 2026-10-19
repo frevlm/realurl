@@ -59,6 +59,18 @@ target_include_directories(realurl_beast INTERFACE
 target_link_libraries(realurl_beast INTERFACE realurl::core Boost::headers)
 
 # ---------------------------------------------------------------------------
+# server: optional HTTP/1.1 server built on Boost.Beast
+# ---------------------------------------------------------------------------
+
+add_library(realurl_server src/server.cpp)
+add_library(realurl::server ALIAS realurl_server)
+target_include_directories(realurl_server PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  "$<INSTALL_INTERFACE:include>")
+target_link_libraries(realurl_server PUBLIC realurl::core Boost::headers Threads::Threads)
+target_link_libraries(realurl_server PRIVATE realurl_warnings)
+
+# ---------------------------------------------------------------------------
 # optional cpp-httplib adapter (header only)
 # ---------------------------------------------------------------------------
 

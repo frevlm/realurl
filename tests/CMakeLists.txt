@@ -10,3 +10,6 @@ realurl_add_test(rate_limit_test)
 realurl_add_test(pump_pool_test)
 realurl_add_test(fd_writer_test)
 realurl_add_test(curl_multi_pool_test)
+
+realurl_add_test(server_test)
+target_link_libraries(server_test PRIVATE realurl::server)
