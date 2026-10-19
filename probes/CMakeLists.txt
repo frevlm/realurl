@@ -1,0 +1,5 @@
+add_executable(realurl_probe_stream_abandon stream_abandon_probe.cpp)
+target_link_libraries(realurl_probe_stream_abandon PRIVATE realurl::core realurl_warnings)
+
+add_executable(realurl_probe_component component_probe.cpp)
+target_link_libraries(realurl_probe_component PRIVATE realurl::core realurl_warnings)

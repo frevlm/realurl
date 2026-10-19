@@ -1,0 +1,12 @@
+function(realurl_add_test name)
+  add_executable(${name} "${name}.cpp")
+  target_link_libraries(${name} PRIVATE realurl::core realurl_warnings)
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+realurl_add_test(buffer_pool_test)
+realurl_add_test(body_feeder_test)
+realurl_add_test(rate_limit_test)
+realurl_add_test(pump_pool_test)
+realurl_add_test(fd_writer_test)
+realurl_add_test(curl_multi_pool_test)
