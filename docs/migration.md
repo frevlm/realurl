@@ -1,6 +1,6 @@
 # Migration from revlm
 
-realurl 0.1.0 is the networking layer of revlm branch
+realurl 0.1.1 is the networking layer of revlm branch
 `feat/native-streaming-v1`, moved without behavioral changes. This document is
 the mapping used by the extraction and by revlm's switch to the library.
 
@@ -55,7 +55,7 @@ Two changes were unavoidable to make the code independent:
 ## How revlm consumes realurl
 
 The root `CMakeLists.txt` sets `REALURL_SOURCE_DIR` to a local checkout, or falls
-back to `FetchContent` from `https://github.com/frevlm/realurl` at tag `v0.1.0`.
+back to `FetchContent` from `https://github.com/frevlm/realurl` at tag `v0.1.1`.
 `backend/CMakeLists.txt` links:
 
 ```cmake

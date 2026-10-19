@@ -108,7 +108,7 @@ request.content_length = declared_length; // -1 when unknown
 
 ## Known limitations
 
-This is version 0.1.0: the code was extracted from revlm without changing behavior. The following defects are known and documented rather than fixed:
+This is version 0.1.1: the code was extracted from revlm without changing behavior. The following defects are known and documented rather than fixed:
 
 1. **`StreamResult` requires an explicit `stream_close()`.** Destroying the result without closing leaves the easy handle attached to the multi handle; the abandon probe reproduces a heap-use-after-free under AddressSanitizer.
 2. **`BodyFeeder` and `BodySource` form a reference cycle.** `make_source()` captures the feeder strongly, so neither object is released until the callbacks are cleared.

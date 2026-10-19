@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(realurl VERSION 0.1.0 LANGUAGES CXX)
+project(realurl VERSION 0.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,7 +12,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-include(CompilerWarnings)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompilerWarnings.cmake")
 
 option(REALURL_BUILD_TESTS "Build unit tests" ON)
 option(REALURL_BUILD_EXAMPLES "Build examples" ON)

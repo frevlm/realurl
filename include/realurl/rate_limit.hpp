@@ -53,8 +53,7 @@ public:
     /// std::make_shared constructs through the allocator, which is not a
     /// friend — do not call directly.
     explicit UploadRateFlow(long long classify_bytes, long long content_length)
-        : classify_bytes_(classify_bytes)
-        , content_length_(content_length)
+        : content_length_(content_length)
         , limited_(content_length < 0 || content_length >= classify_bytes)
     {
     }
@@ -74,7 +73,6 @@ private:
     std::atomic<long long> prev_uploaded_{ 0 };
     std::atomic<bool> tick_progress_{ false };
 
-    long long classify_bytes_ = 0;
     long long content_length_ = 0;
     bool limited_ = false;
 };
