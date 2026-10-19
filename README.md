@@ -32,7 +32,7 @@ The design is deliberately narrow. realurl does not route, authenticate, bill, o
 
 ## Build
 
-Requirements: CMake 3.20+, a C++20 compiler, libcurl, Boost 1.83+ headers (Asio; Beast for the server adapter).
+Requirements: CMake 3.20+, a C++20 compiler, libcurl, Boost 1.83+ headers (Asio; Beast for the server adapter). POSIX only (Linux and macOS); the body feeder and fd writer use POSIX sockets.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
