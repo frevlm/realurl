@@ -52,16 +52,36 @@ Two changes were unavoidable to make the code independent:
    revlm keeps a thin wrapper that reads `config().proxy_client_write_timeout_seconds`
    and forwards to the library, so call sites and behavior stay the same.
 
+## 0.2.0: HTTP entry moved into realurl
+
+realurl 0.2.0 adds `Server`, and revlm now uses it for every HTTP entry point
+(the management/user API and the v1 data plane).  cpp-httplib is no longer a
+revlm dependency.
+
+| revlm before 0.2.0 | realurl 0.2.0 |
+| --- | --- |
+| `backend/include/streaming/beast_server.hpp` | `include/realurl/server.hpp` |
+| `backend/src/streaming/beast_server.cpp` | `src/server.cpp` (accept loop, routing, body modes, takeover) |
+| `backend/include/streaming/transport.hpp` | removed; `backend/include/proxy/streaming_runtime.hpp` keeps rate-limiter init and pump shutdown |
+| `backend/src/streaming/curl_window_transport.cpp` | removed; `backend/src/proxy/streaming_runtime.cpp` |
+| `backend/include/streaming/beast_proxy_dispatch.hpp` | `backend/include/server/v1_dispatch.hpp` |
+| `backend/src/server/http_dispatch.cpp` v1 handlers | `backend/src/server/v1_routes.cpp` |
+| `backend/src/server/http_server.cpp` (`httplib::Server`) | `realurl::Server` lifecycle |
+| `HttplibResponseSink` in gateway paths | `realurl::ServerResponseSink` for fixed responses, `Response::take_over` for streams |
+
+`backend/src/proxy/gateway.cpp` keeps the SSE parsing, usage accounting, and
+pricing.  The old chunked-provider entry points (`Gateway::run_stream`,
+`apply_upstream_gateway_stream`) were removed.
+
 ## How revlm consumes realurl
 
 The root `CMakeLists.txt` sets `REALURL_SOURCE_DIR` to a local checkout, or falls
-back to `FetchContent` from `https://github.com/frevlm/realurl` at tag `v0.1.1`.
+back to `FetchContent` from `https://github.com/frevlm/realurl` at tag `v0.2.0`.
 `backend/CMakeLists.txt` links:
 
 ```cmake
 realurl::core
-realurl::beast
-realurl::httplib
+realurl::server
 ```
 
 The duplicated headers and sources listed under "Moved" are deleted from
