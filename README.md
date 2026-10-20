@@ -130,7 +130,7 @@ request.content_length = declared_length; // -1 when unknown
 
 ## Known limitations
 
-This is version 0.2.0: the transport code was extracted from revlm; the server
+This is version 0.2.1: the transport code was extracted from revlm; the server
 was added afterwards. The following defects are known and documented rather
 than fixed:
 

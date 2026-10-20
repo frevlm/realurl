@@ -803,29 +803,29 @@ Server::~Server()
 
 Server &Server::Get(std::string pattern, Handler handler, RouteOptions options)
 {
-    impl_->add_route("GET", pattern.find("/:") == std::string::npos ? Impl::RouteKind::Exact : Impl::RouteKind::Params,
-                     std::move(pattern), std::move(handler), options);
+    const auto kind = pattern.find("/:") == std::string::npos ? Impl::RouteKind::Exact : Impl::RouteKind::Params;
+    impl_->add_route("GET", kind, std::move(pattern), std::move(handler), options);
     return *this;
 }
 
 Server &Server::Post(std::string pattern, Handler handler, RouteOptions options)
 {
-    impl_->add_route("POST", pattern.find("/:") == std::string::npos ? Impl::RouteKind::Exact : Impl::RouteKind::Params,
-                     std::move(pattern), std::move(handler), options);
+    const auto kind = pattern.find("/:") == std::string::npos ? Impl::RouteKind::Exact : Impl::RouteKind::Params;
+    impl_->add_route("POST", kind, std::move(pattern), std::move(handler), options);
     return *this;
 }
 
 Server &Server::Put(std::string pattern, Handler handler, RouteOptions options)
 {
-    impl_->add_route("PUT", pattern.find("/:") == std::string::npos ? Impl::RouteKind::Exact : Impl::RouteKind::Params,
-                     std::move(pattern), std::move(handler), options);
+    const auto kind = pattern.find("/:") == std::string::npos ? Impl::RouteKind::Exact : Impl::RouteKind::Params;
+    impl_->add_route("PUT", kind, std::move(pattern), std::move(handler), options);
     return *this;
 }
 
 Server &Server::Delete(std::string pattern, Handler handler, RouteOptions options)
 {
-    impl_->add_route("DELETE", pattern.find("/:") == std::string::npos ? Impl::RouteKind::Exact : Impl::RouteKind::Params,
-                     std::move(pattern), std::move(handler), options);
+    const auto kind = pattern.find("/:") == std::string::npos ? Impl::RouteKind::Exact : Impl::RouteKind::Params;
+    impl_->add_route("DELETE", kind, std::move(pattern), std::move(handler), options);
     return *this;
 }
 
