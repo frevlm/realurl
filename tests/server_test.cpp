@@ -40,6 +40,8 @@ void test_process_basics()
     CHECK(hello.find("\r\n\r\nworld") != std::string::npos);
 
     const std::string param = server.process("GET /users/42 HTTP/1.1\r\nHost: test\r\n\r\n");
+    if (param.find("\r\n\r\n42") == std::string::npos)
+        std::cerr << "param response: [" << param << "]\n";
     CHECK(param.find("\r\n\r\n42") != std::string::npos);
 
     const std::string regex = server.process("GET /regex/anything HTTP/1.1\r\nHost: test\r\n\r\n");
