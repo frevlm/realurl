@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 
 project(realurl VERSION 0.3.0 LANGUAGES CXX)
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  message(FATAL_ERROR "realurl requires Clang (GCC's coroutine frontend ICEs on this codebase)")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -18,6 +22,7 @@ option(REALURL_BUILD_TESTS "Build unit tests" ON)
 option(REALURL_BUILD_EXAMPLES "Build examples" ON)
 option(REALURL_BUILD_BENCH "Build benchmarks" OFF)
 option(REALURL_WITH_HTTPLIB "Provide the cpp-httplib response-sink adapter target" OFF)
+option(REALURL_WITH_IO_URING "Use the io_uring completion transport for h2c (Linux)" OFF)
 
 find_package(Threads REQUIRED)
 
@@ -51,6 +56,7 @@ add_library(realurl_core
   src/detail/url.cpp
   src/detail/connection.cpp
   src/detail/client.cpp
+  src/detail/client_group.cpp
   src/detail/tls.cpp
 )
 
@@ -66,6 +72,14 @@ target_include_directories(realurl_core PUBLIC
   "$<INSTALL_INTERFACE:include>")
 target_link_libraries(realurl_core PUBLIC Threads::Threads)
 target_link_libraries(realurl_core PRIVATE ssl crypto realurl_warnings)
+
+if(REALURL_WITH_IO_URING)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "REALURL_WITH_IO_URING is only supported on Linux")
+  endif()
+  target_sources(realurl_core PRIVATE src/detail/uring.cpp src/detail/uring_transport.cpp)
+  target_compile_definitions(realurl_core PRIVATE REALURL_WITH_IO_URING=1)
+endif()
 
 # ---------------------------------------------------------------------------
 # server: HTTP/1.1 server built on Boost.Beast

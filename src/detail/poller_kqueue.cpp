@@ -107,7 +107,7 @@ private:
     {
         if ((next & flag) && !(current & flag)) {
             struct kevent event;
-            EV_SET(&event, static_cast<std::uintptr_t>(fd), filter, EV_ADD | EV_ENABLE, 0, 0,
+            EV_SET(&event, static_cast<std::uintptr_t>(fd), filter, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0,
                    reinterpret_cast<void *>(static_cast<std::intptr_t>(fd)));
             (void)::kevent(kq_, &event, 1, nullptr, 0, nullptr);
         } else if (!(next & flag) && (current & flag)) {

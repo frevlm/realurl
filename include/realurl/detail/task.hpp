@@ -4,8 +4,11 @@
 /// onto an EventLoop. Sub-tasks resume their parent by symmetric transfer;
 /// a top-level Task destroys its own frame on completion.
 
+#include "realurl/detail/coro_pool.hpp"
+
 #include <coroutine>
 #include <exception>
+#include <new>
 #include <optional>
 #include <utility>
 
@@ -21,6 +24,36 @@ struct TaskPromiseBase {
     std::coroutine_handle<> continuation{};
     std::exception_ptr error{};
     EventLoop *loop = nullptr;
+
+    static void *operator new(std::size_t size)
+    {
+        return coro_pool::allocate(size);
+    }
+
+    static void operator delete(void *pointer) noexcept
+    {
+        coro_pool::deallocate(pointer);
+    }
+
+    static void operator delete(void *pointer, std::size_t) noexcept
+    {
+        coro_pool::deallocate(pointer);
+    }
+
+    static void *operator new(std::size_t size, std::align_val_t alignment)
+    {
+        return ::operator new(size, alignment);
+    }
+
+    static void operator delete(void *pointer, std::align_val_t alignment) noexcept
+    {
+        ::operator delete(pointer, alignment);
+    }
+
+    static void operator delete(void *pointer, std::size_t, std::align_val_t alignment) noexcept
+    {
+        ::operator delete(pointer, alignment);
+    }
 
     std::suspend_always initial_suspend() noexcept
     {

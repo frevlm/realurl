@@ -25,68 +25,6 @@ constexpr int kSendFlags = 0;
     throw std::system_error(errno, std::generic_category(), what);
 }
 
-class IoAwaiter {
-public:
-    IoAwaiter(EventLoop &loop, int fd, std::uint32_t events, std::chrono::milliseconds timeout)
-        : loop_(&loop)
-        , fd_(fd)
-        , events_(events)
-        , timeout_(timeout)
-    {
-    }
-
-    bool await_ready() const noexcept
-    {
-        return false;
-    }
-
-    void await_suspend(std::coroutine_handle<> handle)
-    {
-        handle_ = handle;
-        loop_->add_io(fd_, events_, &IoAwaiter::on_ready, this);
-        if (timeout_.count() > 0)
-            timer_ = loop_->schedule(timeout_, [this] { finish(0, ETIMEDOUT); });
-    }
-
-    std::uint32_t await_resume()
-    {
-        if (error_ != 0)
-            throw std::system_error(error_, std::generic_category(), "socket wait");
-        return revents_;
-    }
-
-private:
-    static void on_ready(void *ctx, std::uint32_t events)
-    {
-        static_cast<IoAwaiter *>(ctx)->finish(events, 0);
-    }
-
-    void finish(std::uint32_t events, int error)
-    {
-        if (done_)
-            return;
-        done_ = true;
-        revents_ = events;
-        error_ = error;
-        loop_->del_io(fd_, events_);
-        if (timer_ != 0) {
-            loop_->cancel(timer_);
-            timer_ = 0;
-        }
-        loop_->resume_later(handle_);
-    }
-
-    EventLoop *loop_;
-    int fd_;
-    std::uint32_t events_;
-    std::chrono::milliseconds timeout_;
-    std::coroutine_handle<> handle_{};
-    TimerId timer_ = 0;
-    std::uint32_t revents_ = 0;
-    int error_ = 0;
-    bool done_ = false;
-};
-
 int accept_nonblocking(int fd, sockaddr *address, socklen_t *length)
 {
 #ifdef __linux__
@@ -102,6 +40,98 @@ int accept_nonblocking(int fd, sockaddr *address, socklen_t *length)
 }
 
 } // namespace
+
+/// One parked socket wait. The fd stays registered with the loop for its whole
+/// lifetime; this object only tells the owning stream/listener which coroutine
+/// to resume when the edge arrives.
+class IoWaiter {
+public:
+    IoWaiter(EventLoop &loop, TcpStream &stream, std::uint32_t events, std::chrono::milliseconds timeout)
+        : loop_(&loop)
+        , kind_(Kind::Stream)
+        , stream_(&stream)
+        , events_(events)
+        , timeout_(timeout)
+    {
+    }
+
+    IoWaiter(EventLoop &loop, TcpListener &listener, std::chrono::milliseconds timeout)
+        : loop_(&loop)
+        , kind_(Kind::Listener)
+        , listener_(&listener)
+        , events_(kIoRead)
+        , timeout_(timeout)
+    {
+    }
+
+    ~IoWaiter()
+    {
+        if (done_)
+            return;
+        if (kind_ == Kind::Stream)
+            stream_->stop_wait(events_, this);
+        else
+            listener_->stop_wait(this);
+        if (timer_ != 0)
+            loop_->cancel(timer_);
+    }
+
+    bool await_ready() const noexcept
+    {
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> handle)
+    {
+        handle_ = handle;
+        if (timeout_.count() > 0)
+            timer_ = loop_->schedule(timeout_, [this] { complete(0, ETIMEDOUT); });
+        if (kind_ == Kind::Stream)
+            stream_->start_wait(events_, this);
+        else
+            listener_->start_wait(this);
+    }
+
+    std::uint32_t await_resume()
+    {
+        if (error_ != 0)
+            throw std::system_error(error_, std::generic_category(), "socket wait");
+        return revents_;
+    }
+
+    void complete(std::uint32_t events, int error)
+    {
+        if (done_)
+            return;
+        done_ = true;
+        revents_ = events;
+        error_ = error;
+        if (kind_ == Kind::Stream)
+            stream_->stop_wait(events_, this);
+        else
+            listener_->stop_wait(this);
+        if (timer_ != 0) {
+            loop_->cancel(timer_);
+            timer_ = 0;
+        }
+        loop_->resume_later(handle_);
+    }
+
+private:
+    enum class Kind { Stream, Listener };
+
+    EventLoop *loop_;
+    Kind kind_;
+    TcpStream *stream_ = nullptr;
+    TcpListener *listener_ = nullptr;
+    std::uint32_t events_;
+    std::chrono::milliseconds timeout_;
+    std::coroutine_handle<> handle_{};
+    TimerId timer_ = 0;
+    std::uint32_t revents_ = 0;
+    int error_ = 0;
+    bool done_ = false;
+};
 
 void set_nonblocking(int fd)
 {
@@ -121,6 +151,7 @@ TcpStream::TcpStream(EventLoop &loop, int fd) noexcept
     : loop_(&loop)
     , fd_(fd)
 {
+    register_io();
 }
 
 TcpStream::~TcpStream()
@@ -132,6 +163,9 @@ TcpStream::TcpStream(TcpStream &&other) noexcept
     : loop_(other.loop_)
     , fd_(std::exchange(other.fd_, -1))
 {
+    other.read_waiter_ = nullptr;
+    other.write_waiter_ = nullptr;
+    register_io();
 }
 
 TcpStream &TcpStream::operator=(TcpStream &&other) noexcept
@@ -140,14 +174,64 @@ TcpStream &TcpStream::operator=(TcpStream &&other) noexcept
         close();
         loop_ = other.loop_;
         fd_ = std::exchange(other.fd_, -1);
+        other.read_waiter_ = nullptr;
+        other.write_waiter_ = nullptr;
+        register_io();
     }
     return *this;
+}
+
+void TcpStream::register_io() noexcept
+{
+    if (fd_ >= 0 && loop_ != nullptr)
+        loop_->add_io(fd_, kIoRead | kIoWrite, &TcpStream::on_io, this);
+}
+
+void TcpStream::unregister_io() noexcept
+{
+    if (fd_ >= 0 && loop_ != nullptr)
+        loop_->del_io(fd_);
+    read_waiter_ = nullptr;
+    write_waiter_ = nullptr;
+}
+
+void TcpStream::on_io(void *ctx, std::uint32_t events)
+{
+    static_cast<TcpStream *>(ctx)->handle_io(events);
+}
+
+void TcpStream::handle_io(std::uint32_t events)
+{
+    if (read_waiter_ != nullptr && (events & (kIoRead | kIoError)) != 0)
+        read_waiter_->complete(events, 0);
+    if (write_waiter_ != nullptr && (events & (kIoWrite | kIoError)) != 0)
+        write_waiter_->complete(events, 0);
+}
+
+void TcpStream::start_wait(std::uint32_t events, IoWaiter *waiter)
+{
+    if (fd_ < 0) {
+        waiter->complete(kIoError, EBADF);
+        return;
+    }
+    if ((events & kIoRead) != 0)
+        read_waiter_ = waiter;
+    if ((events & kIoWrite) != 0)
+        write_waiter_ = waiter;
+}
+
+void TcpStream::stop_wait(std::uint32_t events, IoWaiter *waiter) noexcept
+{
+    if ((events & kIoRead) != 0 && read_waiter_ == waiter)
+        read_waiter_ = nullptr;
+    if ((events & kIoWrite) != 0 && write_waiter_ == waiter)
+        write_waiter_ = nullptr;
 }
 
 void TcpStream::close() noexcept
 {
     if (fd_ >= 0) {
-        loop_->del_io(fd_);
+        unregister_io();
         ::close(fd_);
         fd_ = -1;
     }
@@ -157,6 +241,16 @@ void TcpStream::set_nodelay(bool enabled) noexcept
 {
     const int value = enabled ? 1 : 0;
     (void)::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
+}
+
+int TcpStream::release() noexcept
+{
+    if (fd_ < 0)
+        return -1;
+    unregister_io();
+    const int fd = fd_;
+    fd_ = -1;
+    return fd;
 }
 
 Task<std::size_t> TcpStream::read(std::span<char> buffer, std::chrono::milliseconds idle)
@@ -171,7 +265,7 @@ Task<std::size_t> TcpStream::read(std::span<char> buffer, std::chrono::milliseco
             continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             throw_errno("recv");
-        (void)co_await IoAwaiter(*loop_, fd_, kIoRead, idle);
+        (void)co_await IoWaiter(*loop_, *this, kIoRead, idle);
     }
 }
 
@@ -186,7 +280,7 @@ Task<void> TcpStream::write_all(std::string_view data, std::chrono::milliseconds
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            (void)co_await IoAwaiter(*loop_, fd_, kIoWrite, timeout);
+            (void)co_await IoWaiter(*loop_, *this, kIoWrite, timeout);
             continue;
         }
         throw_errno("send");
@@ -195,12 +289,12 @@ Task<void> TcpStream::write_all(std::string_view data, std::chrono::milliseconds
 
 Task<void> TcpStream::wait_readable(std::chrono::milliseconds timeout)
 {
-    (void)co_await IoAwaiter(*loop_, fd_, kIoRead, timeout);
+    (void)co_await IoWaiter(*loop_, *this, kIoRead, timeout);
 }
 
 Task<void> TcpStream::wait_writable(std::chrono::milliseconds timeout)
 {
-    (void)co_await IoAwaiter(*loop_, fd_, kIoWrite, timeout);
+    (void)co_await IoWaiter(*loop_, *this, kIoWrite, timeout);
 }
 
 Task<void> TcpStream::shutdown_write()
@@ -220,17 +314,19 @@ Task<TcpStream> TcpStream::connect(EventLoop &loop, const sockaddr *address, soc
     set_nonblocking(fd);
     set_cloexec(fd);
 
+    TcpStream stream(loop, fd);
+
     if (::connect(fd, address, length) != 0) {
         if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
             const int error = errno;
-            ::close(fd);
+            stream.close();
             throw std::system_error(error, std::generic_category(), "connect");
         }
 
         try {
-            (void)co_await IoAwaiter(loop, fd, kIoWrite, timeout);
+            (void)co_await stream.wait_writable(timeout);
         } catch (...) {
-            ::close(fd);
+            stream.close();
             throw;
         }
 
@@ -238,16 +334,15 @@ Task<TcpStream> TcpStream::connect(EventLoop &loop, const sockaddr *address, soc
         socklen_t error_length = sizeof(error);
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_length) != 0) {
             const int saved = errno;
-            ::close(fd);
+            stream.close();
             throw std::system_error(saved, std::generic_category(), "getsockopt");
         }
         if (error != 0) {
-            ::close(fd);
+            stream.close();
             throw std::system_error(error, std::generic_category(), "connect");
         }
     }
 
-    TcpStream stream(loop, fd);
     stream.set_nodelay(true);
     co_return stream;
 }
@@ -285,6 +380,8 @@ TcpListener::TcpListener(EventLoop &loop, std::uint16_t port, int backlog)
     socklen_t length = sizeof(address);
     if (::getsockname(fd_, reinterpret_cast<sockaddr *>(&address), &length) == 0)
         port_ = ntohs(address.sin_port);
+
+    register_io();
 }
 
 TcpListener::~TcpListener()
@@ -292,10 +389,49 @@ TcpListener::~TcpListener()
     close();
 }
 
+void TcpListener::register_io() noexcept
+{
+    if (fd_ >= 0 && loop_ != nullptr)
+        loop_->add_io(fd_, kIoRead, &TcpListener::on_io, this);
+}
+
+void TcpListener::unregister_io() noexcept
+{
+    if (fd_ >= 0 && loop_ != nullptr)
+        loop_->del_io(fd_);
+    waiter_ = nullptr;
+}
+
+void TcpListener::on_io(void *ctx, std::uint32_t events)
+{
+    static_cast<TcpListener *>(ctx)->handle_io(events);
+}
+
+void TcpListener::handle_io(std::uint32_t events)
+{
+    if (waiter_ != nullptr && (events & (kIoRead | kIoError)) != 0)
+        waiter_->complete(events, 0);
+}
+
+void TcpListener::start_wait(IoWaiter *waiter)
+{
+    if (fd_ < 0) {
+        waiter->complete(kIoError, EBADF);
+        return;
+    }
+    waiter_ = waiter;
+}
+
+void TcpListener::stop_wait(IoWaiter *waiter) noexcept
+{
+    if (waiter_ == waiter)
+        waiter_ = nullptr;
+}
+
 void TcpListener::close() noexcept
 {
     if (fd_ >= 0) {
-        loop_->del_io(fd_);
+        unregister_io();
         ::close(fd_);
         fd_ = -1;
     }
@@ -313,7 +449,7 @@ Task<std::pair<int, sockaddr_storage>> TcpListener::accept()
             continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             throw_errno("accept");
-        (void)co_await IoAwaiter(*loop_, fd_, kIoRead, {});
+        (void)co_await IoWaiter(*loop_, *this, {});
     }
 }
 

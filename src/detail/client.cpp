@@ -7,9 +7,16 @@
 #include "realurl/detail/transport.hpp"
 #include "realurl/detail/url.hpp"
 
+#ifdef REALURL_WITH_IO_URING
+#include "uring_transport.hpp"
+#endif
+
 #include <algorithm>
 #include <cerrno>
+#include <coroutine>
 #include <cstring>
+#include <exception>
+#include <memory>
 #include <stdexcept>
 #include <system_error>
 #include <unordered_map>
@@ -20,6 +27,38 @@ namespace realurl
 {
 namespace detail
 {
+namespace
+{
+
+/// Parks a request until the in-flight connection attempt for its origin
+/// finishes. Without this, a cold pool under concurrency opens one connection
+/// per request.
+class ConnectWaiter {
+public:
+    explicit ConnectWaiter(std::vector<std::coroutine_handle<>> &waiters) noexcept
+        : waiters_(waiters)
+    {
+    }
+
+    bool await_ready() const noexcept
+    {
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> handle)
+    {
+        waiters_.push_back(handle);
+    }
+
+    void await_resume() const noexcept
+    {
+    }
+
+private:
+    std::vector<std::coroutine_handle<>> &waiters_;
+};
+
+} // namespace
 
 class ClientImpl {
 public:
@@ -35,9 +74,10 @@ public:
     {
         const std::string key = origin_key(url);
 
-        auto found = pools_.find(key);
-        if (found != pools_.end()) {
-            auto &list = found->second;
+        OriginPool *pool = nullptr;
+        for (;;) {
+            pool = &pool_for(key);
+            auto &list = pool->conns;
             for (auto it = list.begin(); it != list.end();) {
                 if (!(*it)->usable())
                     it = list.erase(it);
@@ -45,45 +85,106 @@ public:
                     ++it;
             }
 
-            if (!list.empty()) {
-                std::shared_ptr<H2Connection> best_with_room = nullptr;
-                std::shared_ptr<H2Connection> best_overall = nullptr;
+            std::shared_ptr<H2Connection> best_with_room;
+            std::shared_ptr<H2Connection> best_overall;
+            for (const auto &conn : list) {
+                if (best_overall == nullptr || conn->active_streams() < best_overall->active_streams())
+                    best_overall = conn;
 
-                for (const auto &conn : list) {
-                    if (!conn->usable())
-                        continue;
-                    if (best_overall == nullptr || conn->active_streams() < best_overall->active_streams())
-                        best_overall = conn;
-
-                    const std::size_t limit = config_.max_streams_per_conn > 0
-                        ? std::min(conn->max_streams(), static_cast<std::size_t>(config_.max_streams_per_conn))
-                        : conn->max_streams();
-                    if (conn->active_streams() < limit) {
-                        if (best_with_room == nullptr || conn->active_streams() < best_with_room->active_streams())
-                            best_with_room = conn;
-                    }
-                }
-
-                if (best_with_room != nullptr)
-                    co_return best_with_room;
-
-                const int connecting = connecting_[key];
-                if (static_cast<int>(list.size()) + connecting >= config_.max_conns_per_origin) {
-                    if (best_overall != nullptr)
-                        co_return best_overall;
+                const std::size_t limit = config_.max_streams_per_conn > 0
+                    ? std::min(conn->max_streams(), static_cast<std::size_t>(config_.max_streams_per_conn))
+                    : conn->max_streams();
+                if (conn->active_streams() < limit) {
+                    if (best_with_room == nullptr || conn->active_streams() < best_with_room->active_streams())
+                        best_with_room = conn;
                 }
             }
+
+            if (best_with_room != nullptr)
+                co_return best_with_room;
+
+            const int max_conns = std::max(1, config_.max_conns_per_origin);
+            if (best_overall != nullptr && static_cast<int>(list.size()) >= max_conns)
+                co_return best_overall;
+
+            if (pool->connecting) {
+                co_await ConnectWaiter(pool->waiters);
+                if (pool->last_error)
+                    std::rethrow_exception(pool->last_error);
+                continue;
+            }
+
+            pool->connecting = true;
+            pool->last_error = nullptr;
+            break;
         }
 
-        connecting_[key]++;
-        struct ConnectingGuard {
-            int &cnt;
-            ~ConnectingGuard()
-            {
-                cnt--;
-            }
-        } guard{ connecting_[key] };
+        std::shared_ptr<H2Connection> conn;
+        try {
+            conn = co_await dial(url, timeout);
+        } catch (...) {
+            finish_attempt(*pool, nullptr, std::current_exception());
+            throw;
+        }
+        finish_attempt(*pool, conn);
+        co_return conn;
+    }
 
+    void close()
+    {
+        for (auto &entry : pools_) {
+            for (const auto &conn : entry.second->conns)
+                conn->close();
+            entry.second->waiters.clear();
+        }
+        pools_.clear();
+    }
+
+    EventLoop &loop() noexcept
+    {
+        return *loop_;
+    }
+
+private:
+    struct OriginPool {
+        std::vector<std::shared_ptr<H2Connection>> conns;
+        std::vector<std::coroutine_handle<>> waiters;
+        std::exception_ptr last_error;
+        bool connecting = false;
+    };
+
+    static std::string origin_key(const UrlParts &url)
+    {
+        std::string key;
+        key.reserve(url.scheme.size() + url.host.size() + 16);
+        key.append(url.scheme).append("://").append(url.authority());
+        return key;
+    }
+
+    OriginPool &pool_for(const std::string &key)
+    {
+        auto it = pools_.find(key);
+        if (it == pools_.end())
+            it = pools_.emplace(key, std::make_unique<OriginPool>()).first;
+        return *it->second;
+    }
+
+    void finish_attempt(OriginPool &pool, const std::shared_ptr<H2Connection> &conn,
+                        std::exception_ptr error = {})
+    {
+        if (conn)
+            pool.conns.push_back(conn);
+        pool.connecting = false;
+        pool.last_error = std::move(error);
+
+        std::vector<std::coroutine_handle<>> waiters = std::move(pool.waiters);
+        pool.waiters.clear();
+        for (std::coroutine_handle<> handle : waiters)
+            loop_->resume_later(handle);
+    }
+
+    Task<std::shared_ptr<H2Connection>> dial(const UrlParts &url, std::chrono::milliseconds timeout)
+    {
         const std::string connect_host = config_.pinned_ip.empty() ? url.host : config_.pinned_ip;
 
         std::chrono::milliseconds connect_timeout = config_.connect_timeout;
@@ -99,43 +200,22 @@ public:
             TcpStream socket =
                 co_await TcpStream::connect(*loop_, reinterpret_cast<const sockaddr *>(&address.storage),
                                             address.length, connect_timeout);
-            transport = std::make_unique<TcpStream>(std::move(socket));
+#ifdef REALURL_WITH_IO_URING
+            if (loop_->uring() != nullptr)
+                transport = UringTransport::create(*loop_, socket.release());
+#endif
+            if (transport == nullptr)
+                transport = std::make_unique<TcpStream>(std::move(socket));
         }
 
-        auto conn = co_await H2Connection::connect(*loop_, std::move(transport), url.authority(), url.scheme);
-        pools_[key].push_back(conn);
-        co_return conn;
-    }
-
-    void close()
-    {
-        for (auto &entry : pools_) {
-            for (const auto &conn : entry.second)
-                conn->close();
-        }
-        pools_.clear();
-    }
-
-    EventLoop &loop() noexcept
-    {
-        return *loop_;
-    }
-
-private:
-    static std::string origin_key(const UrlParts &url)
-    {
-        std::string key;
-        key.reserve(url.scheme.size() + url.host.size() + 16);
-        key.append(url.scheme).append("://").append(url.authority());
-        return key;
+        co_return co_await H2Connection::connect(*loop_, std::move(transport), url.authority(), url.scheme);
     }
 
     EventLoop *loop_;
     Config config_;
     Resolver resolver_;
     std::shared_ptr<TlsContext> tls_context_;
-    std::unordered_map<std::string, std::vector<std::shared_ptr<H2Connection>>> pools_;
-    std::unordered_map<std::string, int> connecting_;
+    std::unordered_map<std::string, std::unique_ptr<OriginPool>> pools_;
 };
 
 } // namespace detail
@@ -217,7 +297,7 @@ Task<Response> Client::request(std::string method, std::string url, Headers head
     Response response;
     response.head = co_await stream.head(timeout);
 
-    char buffer[65536];
+    char buffer[16384];
     for (;;) {
         const std::size_t n = co_await stream.read({ buffer, sizeof(buffer) }, timeout);
         if (n == 0)

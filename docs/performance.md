@@ -1,12 +1,46 @@
 # Performance
 
-All numbers measured on the 0.3 self-contained stack: Apple M5 / macOS,
-loopback, h2c prior knowledge, Release build, one pooled HTTP/2 connection
-(`connections=1` in every run). The benchmark (`bench/realurl_bench`) warms up
-the connection before starting the clocks, so percentiles reflect steady
-state. RSS/CPU include the in-tree test server that runs in the same process.
+All numbers measured on Apple M5 / macOS, loopback, h2c prior knowledge,
+Release build, one pooled HTTP/2 connection (`connections=1` in every run).
+The benchmark (`bench/realurl_bench`) warms up the connection before starting
+the clocks, so percentiles reflect steady state. RSS/CPU include the in-tree
+test server that runs in the same process. The tables below the architecture
+pass are the original 0.3 baseline.
 
-## Request mode: `realurl_bench requests <N> <concurrency>`
+## Current architecture pass
+
+Measured on the same machine before and after the persistent-poll, frame-pool
+and connection-coalescing changes:
+
+| Run | Result |
+| --- | --- |
+| `requests 50000 1` | 39,042 req/s, p50 0.025 ms, 16.0 MB peak |
+| `requests 200000 1000 1` | 401-463k req/s over 5 runs, p50 2.37 ms, p99 3.73 ms, 4.6 µs CPU/req |
+| `requests_mt 200000 1000 2 1` | 543-575k req/s across two loops, p50 1.80 ms |
+| `requests_mt 200000 1000 4 1` | 211,266 req/s (server-limited, see note) |
+| `hold 10000` | 435-459k streams/s to open, 0.56 KB/stream, ~0 CPU while idle |
+
+Before/after on the same machine: single-stream 37k -> 39k req/s, 1,000-way
+392k -> 401-463k req/s, 1,000-way peak RSS ~60-70 MB (from 69 MB; the step
+measurement after the poll change was 51 MB, and allocator behaviour varies
+between runs), and stream-open rate 289k -> 435-459k/s.
+
+The multi-loop run is limited by the in-tree test server above two workers:
+it uses blocking sockets and two `send()` calls per response on a
+per-connection thread, and the host has 4 performance + 6 efficiency cores.
+Treat `requests_mt` as a client-scaling check, not a server benchmark; use an
+external load peer for absolute multi-loop numbers.
+
+### io_uring
+
+`REALURL_WITH_IO_URING=ON` builds the completion transport (raw kernel UAPI,
+no liburing). It is functionally verified on Linux with Clang 18: all 12 tests
+pass, and `client_test`/`client_group_test` drive h2c through ring recv/send.
+It stays opt-in because it is Linux-only and because one-shot recv/send still
+costs one `io_uring_enter` per operation; batching or multishot is the next
+step before claiming a throughput win.
+
+## 0.3 baseline: `realurl_bench requests <N> <concurrency>`
 
 20,000 `client.get()` requests over one multiplexed connection:
 
@@ -111,8 +145,8 @@ libcurl.
   a load engine. End-to-end proxy numbers depend on revlm's gateway paths and
   are out of scope here.
 - TLS handshake and bulk transfer were validated functionally
-  (`client_test` TLS case); a dedicated TLS throughput benchmark is planned
-  alongside the io_uring backend.
+  (`client_test` TLS case); a dedicated TLS throughput benchmark is still
+  planned.
 
 ## Reproduce
 
@@ -121,6 +155,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DREALURL_BUILD_BENCH=ON
 cmake --build build
 ./build/bench/realurl_bench requests 20000 100
 ./build/bench/realurl_bench requests 20000 1000
+./build/bench/realurl_bench requests_mt 200000 1000 2 1
 ./build/bench/realurl_bench hold 10000
 ./build/bench/realurl_bench llm 100 100 20
 ./build/bench/realurl_bench llm 1000 1000 20
@@ -128,7 +163,12 @@ cmake --build build
 
 ## Known limitations
 
-1. Coroutine frames are heap-allocated; a per-loop arena is the next
-   optimization.
+1. Timers still use a `std::function` priority queue with lazy cancellation;
+   a long-lived process accumulates expired nodes until they reach the heap
+   top, and every timed wait pays a function-object construction. An
+   intrusive timer wheel is the next allocation win.
 2. `writev` batching exists only implicitly through the writer coroutine; a
    user-provided `write_owned(std::string&&)` zero-copy path is reserved.
+3. The io_uring transport submits one recv or send per `io_uring_enter`.
+   Multishot recv with provided buffers and SQPOLL are the next steps for that
+   backend.

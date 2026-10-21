@@ -23,5 +23,8 @@ realurl_add_test(client_test)
 target_link_libraries(client_test PRIVATE realurl_test_support)
 target_compile_definitions(client_test PRIVATE REALURL_CERT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/certs")
 
+realurl_add_test(client_group_test)
+target_link_libraries(client_group_test PRIVATE realurl_test_support)
+
 realurl_add_test(server_test)
 target_link_libraries(server_test PRIVATE realurl::server)

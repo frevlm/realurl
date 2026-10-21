@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -58,6 +60,143 @@ realurl::Task<void> bench_worker(realurl::Client &client, const std::string &url
         local.push_back(
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     }
+}
+
+struct MtBenchState {
+    /// One quota per worker. Only that worker's loop thread touches it, so the
+    /// per-request claim is a plain decrement instead of a contended CAS.
+    std::vector<int> remaining;
+    std::atomic<int> requesters{ 0 };
+    std::atomic<int> failures{ 0 };
+    std::vector<std::vector<double>> latencies;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+};
+
+realurl::Task<void> mt_requester(realurl::ClientGroup &group, const std::string &url, MtBenchState &state, int slot)
+{
+    std::vector<double> local;
+    for (;;) {
+        if (state.remaining[static_cast<std::size_t>(slot)] <= 0)
+            break;
+        --state.remaining[static_cast<std::size_t>(slot)];
+
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            (void)co_await group.get(url, 10s);
+        } catch (...) {
+            state.failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        local.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    }
+
+    auto &target = state.latencies[static_cast<std::size_t>(slot)];
+    target.insert(target.end(), local.begin(), local.end());
+
+    if (state.requesters.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.done = true;
+        state.cv.notify_all();
+    }
+}
+
+realurl::Task<void> mt_worker(realurl::ClientGroup &group, const std::string &url, MtBenchState &state, int slot,
+                              int window)
+{
+    for (int i = 0; i < window; ++i)
+        realurl::EventLoop::current().spawn(mt_requester(group, url, state, slot));
+    co_return;
+}
+
+realurl::Task<void> mt_warmup(realurl::ClientGroup &group, const std::string &url, std::atomic<int> &warmed,
+                              int target, std::mutex &mutex, std::condition_variable &cv)
+{
+    try {
+        (void)co_await group.get(url, 10s);
+    } catch (...) {
+    }
+    if (warmed.fetch_add(1, std::memory_order_acq_rel) + 1 == target) {
+        std::lock_guard<std::mutex> lock(mutex);
+        cv.notify_all();
+    }
+    co_return;
+}
+
+int run_requests_mt(int total, int concurrency, int workers, int connections = 1)
+{
+    total = std::max(1, total);
+    concurrency = std::max(1, concurrency);
+    workers = std::max(1, workers);
+    connections = std::max(1, connections);
+
+    realurl::test::H2TestServer server([](const realurl::test::H2TestRequest &) {
+        realurl::test::H2TestResponse response;
+        response.body = "bench";
+        return response;
+    });
+
+    realurl::Config config;
+    config.max_conns_per_origin = connections;
+    config.max_streams_per_conn =
+        std::max(1, (concurrency + workers * connections - 1) / (workers * connections));
+    realurl::ClientGroup group(static_cast<unsigned>(workers), config);
+    const std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/bench";
+
+    // Open one pooled connection per worker before the timed burst.
+    std::atomic<int> warmed{ 0 };
+    std::mutex warm_mutex;
+    std::condition_variable warm_cv;
+    const int warm_target = workers * connections;
+    for (int i = 0; i < warm_target; ++i)
+        group.spawn_on(static_cast<std::size_t>(i % workers),
+                       mt_warmup(group, url, warmed, warm_target, warm_mutex, warm_cv));
+    {
+        std::unique_lock<std::mutex> lock(warm_mutex);
+        warm_cv.wait_for(lock, 30s, [&] { return warmed.load(std::memory_order_acquire) >= warm_target; });
+    }
+
+    MtBenchState state;
+    state.remaining.assign(static_cast<std::size_t>(workers), total / workers);
+    for (int i = 0; i < total % workers; ++i)
+        ++state.remaining[static_cast<std::size_t>(i)];
+    state.latencies.resize(static_cast<std::size_t>(workers));
+    const int window = std::max(1, concurrency / workers);
+    state.requesters.store(workers * window);
+    const bench::CpuTime cpu_start = bench::cpu_time();
+    const auto wall_start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < workers; ++i)
+        group.spawn_on(static_cast<std::size_t>(i), mt_worker(group, url, state, i, window));
+
+    {
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.cv.wait(lock, [&] { return state.done; });
+    }
+    const auto wall_end = std::chrono::steady_clock::now();
+    const bench::CpuTime cpu_end = bench::cpu_time();
+
+    std::vector<double> latencies_ms;
+    latencies_ms.reserve(static_cast<std::size_t>(total));
+    for (auto &local : state.latencies)
+        latencies_ms.insert(latencies_ms.end(), local.begin(), local.end());
+
+    const double wall = std::chrono::duration<double>(wall_end - wall_start).count();
+    const std::vector<double> pct = percentiles(std::move(latencies_ms));
+    std::printf("mode=requests_mt requests=%d concurrency=%d workers=%d connections=%d\n", total, concurrency,
+                workers, server.connections());
+    std::printf("  throughput: %.0f req/s (wall %.2fs)\n", total / wall, wall);
+    if (!pct.empty())
+        std::printf("  latency ms: p50=%.3f p90=%.3f p95=%.3f p99=%.3f p99.9=%.3f max=%.3f\n", pct[0], pct[1],
+                    pct[2], pct[3], pct[4], pct[5]);
+    std::printf("  failures: %d\n", state.failures.load(std::memory_order_relaxed));
+    std::printf("  cpu: user=%.2fs sys=%.2fs total=%.2fs (%.3f ms/req)\n", cpu_end.user - cpu_start.user,
+                cpu_end.system - cpu_start.system, cpu_end.total() - cpu_start.total(),
+                (cpu_end.total() - cpu_start.total()) * 1000.0 / total);
+    std::printf("  rss: peak=%.1fMB current=%.1fMB\n", megabytes(bench::peak_rss_bytes()),
+                megabytes(bench::current_rss_bytes()));
+    return 0;
 }
 
 int run_requests(int total, int concurrency, int connections = 1)
@@ -345,6 +484,13 @@ int main(int argc, char **argv)
         const int connections = argc > 4 ? std::atoi(argv[4]) : 1;
         return run_requests(total, concurrency, connections);
     }
+    if (mode == "requests_mt") {
+        const int total = argc > 2 ? std::atoi(argv[2]) : 20000;
+        const int concurrency = argc > 3 ? std::atoi(argv[3]) : 100;
+        const int workers = argc > 4 ? std::atoi(argv[4]) : 4;
+        const int connections = argc > 5 ? std::atoi(argv[5]) : 1;
+        return run_requests_mt(total, concurrency, workers, connections);
+    }
     if (mode == "hold") {
         const int streams = argc > 2 ? std::atoi(argv[2]) : 1000;
         return run_hold(streams);
@@ -359,8 +505,8 @@ int main(int argc, char **argv)
     }
 
     std::fprintf(stderr,
-                 "usage: %s requests <N> <concurrency> [connections] | hold <streams> | llm <total> <concurrency> "
-                 "[duration_s] [streaming] [connections]\n",
+                 "usage: %s requests <N> <concurrency> [connections] | requests_mt <N> <concurrency> <workers> "
+                 "[connections] | hold <streams> | llm <total> <concurrency> [duration_s] [streaming] [connections]\n",
                  argv[0]);
     return 2;
 }

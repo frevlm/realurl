@@ -15,6 +15,13 @@ A `Client` and every connection it creates belong to one loop. Connections are
 never shared between loops; `SSL_CTX` (via `TlsContext`) is the only shared
 TLS object because BoringSSL guarantees its thread safety.
 
+`ClientGroup` owns N loop/client pairs, one per worker thread. A task submitted
+with `spawn()`/`spawn_on()` runs on a worker loop, and `get()`/`request()`
+called from inside that loop uses the worker's `Client` directly. Calls from a
+different loop are dispatched through `post()` and the result is posted back;
+that path is convenient but costs a thread hop per request, so throughput
+sensitive callers should keep their work on the worker loops.
+
 ## Coroutine core
 
 `Task<T>` is a cold coroutine with symmetric transfer: awaiting a child stores
@@ -31,12 +38,26 @@ gives one well-defined resume point per await.
 Timeouts are loop timers captured by the awaiter; whichever of IO/timer fires
 first completes the awaiter and both paths are idempotent (`done` flag).
 
+Coroutine frames are allocated by `TaskPromiseBase::operator new`. A
+thread-local size-class cache (`detail/coro_pool.hpp`) serves frames up to
+32 KiB; over-aligned or larger frames fall back to the global allocator. This
+removes the malloc/free pair that every helper `co_await`
+(`head`/`read`/`write`/`end`) would otherwise pay.
+
 ## Event loop
 
 | Platform | Backend | Wakeup |
 | --- | --- | --- |
-| Linux | `epoll_create1` + `EPOLLONESHOT`-free level trigger | `eventfd` |
-| macOS | `kqueue` + `EVFILT_READ/WRITE` | `EVFILT_USER` |
+| Linux | `epoll_create1` + `EPOLLET` | `eventfd` |
+| macOS | `kqueue` + `EVFILT_READ/WRITE` + `EV_CLEAR` | `EVFILT_USER` |
+
+Sockets register read/write interest once, when the `TcpStream` is created,
+and never unregister it per operation. `TcpStream` keeps at most one parked
+reader and one parked writer; the poller callback resumes the parked coroutine
+(or drops the edge when nothing is waiting). Every operation tries the syscall
+first, so an edge consumed while no awaiter was parked is harmless. This
+removes the `epoll_ctl`/`kevent` pair that a per-wait registration would cost
+on every EAGAIN.
 
 Timer wheel is a `priority_queue` with lazy cancellation (`TimerId` set).
 `run_once()` order: posted callbacks → due timers → poll (timeout clamped to
@@ -99,13 +120,27 @@ credit correctly and wake every suspended waiter exactly once.
 to `Config::max_conns_per_origin` connections. Selection prefers the
 connection with the fewest active streams under the peer's
 `MAX_CONCURRENT_STREAMS`; unusable connections (GOAWAY, error) are dropped
-lazily. `Client::close()` (also run by the destructor) sends GOAWAY and shuts
-down every socket so peers observe EOF promptly.
+lazily. A cold pool coalesces connection attempts: the first request starts
+the connect and later requests park on the origin's waiter list, then retry
+selection when the attempt completes. Without this, a burst of N requests
+opened N connections. `Client::close()` (also run by the destructor) sends
+GOAWAY and shuts down every socket so peers observe EOF promptly.
+
+### io_uring (optional)
+
+`REALURL_WITH_IO_URING=ON` switches plaintext (h2c) connections to
+`UringTransport`, a completion-based transport on a per-loop raw io_uring ring
+(kernel UAPI, no liburing dependency). recv/send are submitted as SQEs and the
+loop is woken by an eventfd registered with the ring; completions are drained
+into the normal ready list. TLS stays on the readiness-based `TcpStream`
+because BoringSSL owns the fd. The backend is opt-in and Linux-only; the
+default build is unchanged.
 
 ## What is deliberately absent
 
 HTTP/1.1 client fallback, HTTP/3, proxies, priority trees (parsed, ignored),
 server push (`ENABLE_PUSH=0`, PUSH_PROMISE is a connection error), trailers
-emission, DNS beyond a thread-pool `getaddrinfo`, and io_uring. Each has a
-seam: `Transport` for socket backends, `Resolver` for name resolution,
-`ErrorCode`/`FrameType` for protocol versions.
+emission, and DNS beyond a thread-pool `getaddrinfo`. Each has a seam:
+`Transport` for socket backends, `Resolver` for name resolution,
+`ErrorCode`/`FrameType` for protocol versions. io_uring is available behind
+`REALURL_WITH_IO_URING` for h2c only.

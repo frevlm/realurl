@@ -17,7 +17,7 @@ namespace
 
 std::uint32_t to_epoll(std::uint32_t mask)
 {
-    std::uint32_t events = 0;
+    std::uint32_t events = EPOLLET;
     if (mask & kIoRead)
         events |= EPOLLIN;
     if (mask & kIoWrite)

@@ -4,6 +4,7 @@
 #include "realurl/detail/transport.hpp"
 
 #include <chrono>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -14,8 +15,14 @@
 namespace realurl::detail
 {
 
+class IoWaiter;
+
 /// Non-blocking TCP stream bound to one event loop. All methods must be called
 /// from that loop's thread.
+///
+/// The fd is registered with the loop once, edge-triggered, for both
+/// directions. Awaiters only park themselves in the stream; no poller syscall
+/// is made per read/write wait.
 class TcpStream : public Transport {
 public:
     TcpStream(EventLoop &loop, int fd) noexcept;
@@ -49,6 +56,9 @@ public:
     void close() noexcept override;
     void set_nodelay(bool enabled) noexcept;
 
+    /// Give up the fd without closing it (used by the io_uring transport).
+    int release() noexcept;
+
     Task<void> wait_readable(std::chrono::milliseconds timeout = {});
     Task<void> wait_writable(std::chrono::milliseconds timeout = {});
 
@@ -57,8 +67,19 @@ public:
                                    std::chrono::milliseconds timeout);
 
 private:
+    friend class IoWaiter;
+
+    void register_io() noexcept;
+    void unregister_io() noexcept;
+    static void on_io(void *ctx, std::uint32_t events);
+    void handle_io(std::uint32_t events);
+    void start_wait(std::uint32_t events, IoWaiter *waiter);
+    void stop_wait(std::uint32_t events, IoWaiter *waiter) noexcept;
+
     EventLoop *loop_ = nullptr;
     int fd_ = -1;
+    IoWaiter *read_waiter_ = nullptr;
+    IoWaiter *write_waiter_ = nullptr;
 };
 
 class TcpListener {
@@ -84,9 +105,19 @@ public:
     void close() noexcept;
 
 private:
+    friend class IoWaiter;
+
+    void register_io() noexcept;
+    void unregister_io() noexcept;
+    static void on_io(void *ctx, std::uint32_t events);
+    void handle_io(std::uint32_t events);
+    void start_wait(IoWaiter *waiter);
+    void stop_wait(IoWaiter *waiter) noexcept;
+
     EventLoop *loop_ = nullptr;
     int fd_ = -1;
     std::uint16_t port_ = 0;
+    IoWaiter *waiter_ = nullptr;
 };
 
 void set_nonblocking(int fd);

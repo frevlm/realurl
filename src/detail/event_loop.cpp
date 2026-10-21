@@ -2,6 +2,10 @@
 
 #include "poller.hpp"
 
+#ifdef REALURL_WITH_IO_URING
+#include "uring.hpp"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -62,7 +66,13 @@ struct EventLoop::Impl {
     TimerId next_timer_id = 1;
 
     std::vector<std::coroutine_handle<>> ready;
+    std::vector<std::coroutine_handle<>> batch;
     std::atomic<bool> stopped{ false };
+
+#ifdef REALURL_WITH_IO_URING
+    bool uring_attempted = false;
+    std::unique_ptr<Uring> uring;
+#endif
 
     static std::uint32_t mask_of(const FdState &state)
     {
@@ -149,10 +159,10 @@ bool EventLoop::run_once()
     }
 
     while (!impl.ready.empty()) {
-        std::vector<std::coroutine_handle<>> batch;
-        batch.swap(impl.ready);
-        for (std::coroutine_handle<> handle : batch)
+        impl.batch.swap(impl.ready);
+        for (std::coroutine_handle<> handle : impl.batch)
             handle.resume();
+        impl.batch.clear();
     }
 
     return !impl.stopped.load(std::memory_order_relaxed);
@@ -279,5 +289,18 @@ void EventLoop::wakeup()
 {
     impl_->poller->wakeup();
 }
+
+#ifdef REALURL_WITH_IO_URING
+Uring *EventLoop::uring()
+{
+    if (!impl_->uring && !impl_->uring_attempted) {
+        impl_->uring_attempted = true;
+        auto ring = std::make_unique<Uring>(*this);
+        if (ring->valid())
+            impl_->uring = std::move(ring);
+    }
+    return impl_->uring.get();
+}
+#endif
 
 } // namespace realurl::detail

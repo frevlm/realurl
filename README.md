@@ -37,16 +37,35 @@ loop.spawn(run());
 loop.run();
 ```
 
-That is the whole surface: `Client`, `Stream`, `Response`, `Header`, `Config`,
-`Task`, `EventLoop`. No connection handles, no session objects, no request
-builders. A `Stream` is move-only; destroying one without `end()`/`cancel()`
-sends RST_STREAM.
+That is the whole surface: `Client`, `ClientGroup`, `Stream`, `Response`,
+`Header`, `Config`, `Task`, `EventLoop`. No connection handles, no session
+objects, no request builders. A `Stream` is move-only; destroying one without
+`end()`/`cancel()` sends RST_STREAM.
+
+`ClientGroup` runs N loop/client pairs on N threads and spreads work across
+them. Tasks run on a worker loop use that worker's client directly (no
+cross-thread hop); callers on another loop get the result posted back:
+
+```cpp
+realurl::Task<void> fetch(realurl::ClientGroup &group)
+{
+    realurl::Response r = co_await group.get("https://example.com/");
+    /* ... */
+}
+
+realurl::ClientGroup group(4);
+group.spawn(fetch(group));   // runs on one worker loop
+```
 
 Rules:
 
 - A `Client` belongs to the `EventLoop` that created it. Use it only from that
   loop's thread. Connections are pooled per origin and shared by every stream
   opened through the client.
+- A `ClientGroup` owns its worker loops and must outlive every task submitted
+  to it. `get()`/`request()` need an `EventLoop` on the calling thread; tasks
+  passed to `spawn()` run on a worker loop and use that worker's client
+  without a cross-thread hop.
 - `sync_wait(task)` runs a task on a private loop from any other thread.
 - Errors are `std::system_error` (`errc::timed_out`, `errc::connection_reset`,
   ...). Non-2xx responses are not errors; check `Response::head.status`.
@@ -57,17 +76,20 @@ Rules:
 
 | Layer | Files | Notes |
 | --- | --- | --- |
-| Coroutine core | `detail/task.hpp` | `Task<T>`, symmetric transfer, `sync_wait` |
-| Event loop | `detail/event_loop.hpp`, `src/detail/poller_{epoll,kqueue}.cpp` | epoll on Linux, kqueue on macOS, timer heap, lock-free hot path |
+| Coroutine core | `detail/task.hpp`, `detail/coro_pool.hpp` | `Task<T>`, symmetric transfer, `sync_wait`, per-thread frame cache |
+| Event loop | `detail/event_loop.hpp`, `src/detail/poller_{epoll,kqueue}.cpp` | epoll on Linux, kqueue on macOS, edge-triggered persistent registration, timer heap |
 | Sockets | `detail/socket.hpp` | Non-blocking connect/read/write, listener, resolver |
 | TLS | `detail/tls.hpp`, BoringSSL | TLS 1.3, ALPN must be h2, SNI, certificate verification |
 | HTTP/2 | `detail/frame.hpp`, `detail/hpack.hpp`, `detail/connection.hpp` | Full HPACK (Huffman + dynamic table), flow control, GOAWAY/PING/RST |
-| Client | `realurl/http2.hpp`, `detail/client.hpp` | Pool per origin, `get`/`request`/`open` |
+| Client | `realurl/http2.hpp`, `detail/client.hpp`, `detail/client_group.cpp` | Pool per origin with coalesced connection attempts, sharded `ClientGroup` |
+| io_uring (optional) | `detail/uring*.cpp` | Completion-based h2c transport, Linux only, `REALURL_WITH_IO_URING` |
 
 ## Build
 
-Requirements: CMake 3.20+, a C++20 compiler, Go (BoringSSL builds codegen
-during configure). POSIX only (Linux and macOS).
+Requirements: CMake 3.20+, Clang 17+ (macOS AppleClang or Linux clang),
+Go (BoringSSL builds codegen during configure). POSIX only (Linux and macOS).
+GCC is not supported: its coroutine frontend ICEs on this codebase, including
+the current release.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -83,6 +105,7 @@ Options:
 | `REALURL_BUILD_EXAMPLES` | `ON` | `fetch` and `stream` examples |
 | `REALURL_BUILD_BENCH` | `OFF` | Loopback h2c benchmark |
 | `REALURL_WITH_HTTPLIB` | `OFF` | cpp-httplib response-sink adapter |
+| `REALURL_WITH_IO_URING` | `OFF` | Completion-based h2c transport on Linux (raw UAPI, no liburing) |
 
 BoringSSL is fetched at a pinned commit on first configure (needs Go on
 `PATH`); all BoringSSL types stay inside `src/detail/tls.cpp`.
@@ -94,7 +117,12 @@ measured numbers. The short version:
 
 - **One thread, one loop, no locks on the hot path.** IO completions, timers,
   and coroutine resumption all run on the loop thread. Only `post()` crosses
-  threads.
+  threads. `ClientGroup` adds worker loops rather than sharing one.
+- **One poller registration per socket.** Sockets register edge-triggered
+  read/write interest once and awaiters park in the stream; steady-state
+  traffic makes no `epoll_ctl`/`kevent` calls.
+- **Coroutine frames are pooled per thread.** `Task` frames come from a
+  size-class free list instead of malloc/free on every `co_await`.
 - **Zero-copy read path when the caller keeps up.** DATA payload is memcpy'd
   straight into the suspended reader's buffer; a bounded 1 MiB receive buffer
   plus paused WINDOW_UPDATEs provide backpressure when it does not.

@@ -104,6 +104,43 @@ private:
     std::shared_ptr<detail::H2StreamImpl> impl_;
 };
 
+/// Multi-loop client: owns `workers` EventLoops, each running on its own
+/// thread, and spreads requests across them. Call it from any EventLoop
+/// thread; the result is delivered back to the caller's loop.
+///
+/// Unlike Client, this type does not expose open(): a Stream is bound to the
+/// loop that owns its connection, so streaming handles cannot cross loops.
+class ClientGroup {
+public:
+    explicit ClientGroup(unsigned workers, Config config = {});
+    ~ClientGroup();
+
+    ClientGroup(const ClientGroup &) = delete;
+    ClientGroup &operator=(const ClientGroup &) = delete;
+
+    std::size_t workers() const noexcept;
+
+    Task<Response> get(std::string url, std::chrono::milliseconds timeout = {});
+
+    Task<Response> request(std::string method, std::string url, Headers headers = {}, std::string body = {},
+                           std::chrono::milliseconds timeout = {});
+
+    /// Run one task on a worker loop (round-robin). Thread-safe. Tasks that
+    /// call get()/request() from inside a worker loop use that worker's Client
+    /// directly, without a cross-thread round trip.
+    void spawn(Task<void> &&task);
+
+    /// Run one task on a specific worker (index modulo worker count).
+    void spawn_on(std::size_t worker, Task<void> &&task);
+
+    /// Drop idle connections on every worker. Worker loops keep running.
+    void close();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 class Client {
 public:
     explicit Client(EventLoop &loop, Config config = {});

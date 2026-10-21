@@ -306,12 +306,19 @@ int main()
     }
 
     {
+        realurl::test::H2TestServer server([](const realurl::test::H2TestRequest &) {
+            realurl::test::H2TestResponse response;
+            response.body = "ok";
+            return response;
+        });
+
         realurl::EventLoop loop;
         realurl::Client client(loop);
         bool threw = false;
+        const std::string url = url_for(server, "/bad-header");
         run_task(loop, [&]() -> realurl::Task<void> {
             try {
-                (void)co_await client.request("GET", "http://127.0.0.1:8080/x", { { "X-Bad\r\nHeader", "value" } });
+                (void)co_await client.request("GET", url, { { "X-Bad\r\nHeader", "value" } });
             } catch (const std::invalid_argument &) {
                 threw = true;
             }

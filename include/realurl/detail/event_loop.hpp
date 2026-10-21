@@ -22,6 +22,10 @@
 namespace realurl::detail
 {
 
+#ifdef REALURL_WITH_IO_URING
+class Uring;
+#endif
+
 using TimerId = std::uint64_t;
 
 enum : std::uint32_t {
@@ -79,6 +83,12 @@ public:
     void resume_later(std::coroutine_handle<> handle);
 
     void wakeup();
+
+#ifdef REALURL_WITH_IO_URING
+    /// Lazily create the per-loop io_uring. Returns nullptr when the kernel or
+    /// sandbox does not allow io_uring.
+    Uring *uring();
+#endif
 
 private:
     struct Impl;
