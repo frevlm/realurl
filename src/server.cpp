@@ -158,6 +158,8 @@ long long parse_content_length(std::string_view text)
     for (char c : text) {
         if (c < '0' || c > '9')
             return -1;
+        if (value > (std::numeric_limits<long long>::max() - (c - '0')) / 10)
+            return -1;
         value = value * 10 + (c - '0');
     }
     return value;
@@ -260,6 +262,18 @@ std::shared_ptr<BodySource> make_memory_source(std::shared_ptr<std::string> data
     };
     source->consume = [offset](std::size_t count) { *offset += count; };
     source->peek = [data]() { return data->substr(0, 65536); };
+    source->wake = [] {};
+    return source;
+}
+
+std::shared_ptr<BodySource> make_empty_source()
+{
+    auto source = std::make_shared<BodySource>();
+    source->read = []() -> BodyReadResult {
+        return { {}, true, false };
+    };
+    source->consume = [](std::size_t) {};
+    source->peek = []() { return std::string{}; };
     source->wake = [] {};
     return source;
 }
@@ -468,6 +482,11 @@ struct Server::Impl {
         }
 
         Request request = make_request(parser.get(), std::string{ remote_addr }, 0);
+        if (request.has_header("Content-Length") && request.content_length < 0)
+            return error_response(400);
+        if (request.target.empty() || request.path.empty() ||
+            (request.path[0] != '/' && !(request.method == "OPTIONS" && request.target == "*")))
+            return error_response(400);
 
         if (pre_routing) {
             Response response;
@@ -492,12 +511,16 @@ struct Server::Impl {
             const auto transfer_encoding = request.get_header("Transfer-Encoding");
             if (!transfer_encoding.empty())
                 return error_response(400);
+            if (request.content_length < 0)
+                return error_response(400);
             if (payload_max > 0 && request.content_length > static_cast<long long>(payload_max))
                 return error_response(413);
             if (request.content_length > 0) {
                 auto data = std::make_shared<std::string>(static_cast<const char *>(buffer.data().data()), buffer.size());
                 data->append(stream.data.substr(stream.pos));
                 request.body_source = make_memory_source(std::move(data));
+            } else {
+                request.body_source = make_empty_source();
             }
         }
 
@@ -618,6 +641,15 @@ struct Server::Impl {
         }
 
         Request request = impl->make_request(parser.get(), remote_addr, remote_port);
+        if (request.has_header("Content-Length") && request.content_length < 0) {
+            co_await write_error(stream, impl, 400, false);
+            co_return;
+        }
+        if (request.target.empty() || request.path.empty() ||
+            (request.path[0] != '/' && !(request.method == "OPTIONS" && request.target == "*"))) {
+            co_await write_error(stream, impl, 400, false);
+            co_return;
+        }
 
         if (impl->pre_routing) {
             Response pre_response;
@@ -658,6 +690,10 @@ struct Server::Impl {
                 co_await write_error(stream, impl, 400, false);
                 co_return;
             }
+            if (request.content_length < 0) {
+                co_await write_error(stream, impl, 400, false);
+                co_return;
+            }
             if (impl->payload_max > 0 && request.content_length > static_cast<long long>(impl->payload_max)) {
                 co_await write_error(stream, impl, 413, false);
                 co_return;
@@ -667,6 +703,8 @@ struct Server::Impl {
                 request.body_source = streamed.start(impl, stream.socket().native_handle(), initial,
                                                      static_cast<long long>(impl->payload_max));
                 buffer.consume(buffer.size());
+            } else {
+                request.body_source = make_empty_source();
             }
         }
 

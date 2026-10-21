@@ -123,13 +123,9 @@ private:
     StreamPumpPool(const StreamPumpPool &) = delete;
     StreamPumpPool &operator=(const StreamPumpPool &) = delete;
 
-    struct Worker {
-        std::mutex mu;
-        std::condition_variable cv;
-        std::deque<std::function<void()>> tasks;
-    };
-
-    std::vector<std::unique_ptr<Worker>> workers_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> tasks_;
     std::vector<std::thread> threads_;
     size_t size_ = 0;
     std::atomic<bool> stop_{ false };

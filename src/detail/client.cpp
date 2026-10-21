@@ -200,11 +200,19 @@ Task<Response> Client::get(std::string url, std::chrono::milliseconds timeout)
 Task<Response> Client::request(std::string method, std::string url, Headers headers, std::string body,
                                std::chrono::milliseconds timeout)
 {
-    Stream stream = co_await open(method, std::move(url), std::move(headers), timeout);
+    if (method.empty())
+        throw std::invalid_argument("h2 request: empty method");
+    const bool has_body = !body.empty();
+    const detail::UrlParts parts = detail::parse_url(url);
+    std::shared_ptr<detail::H2Connection> connection = co_await impl_->connection(parts, timeout);
+    std::shared_ptr<detail::H2StreamImpl> stream_impl =
+        connection->open(method, parts.path, std::move(headers), !has_body);
+    Stream stream(std::move(stream_impl));
 
-    if (!body.empty())
+    if (has_body) {
         co_await stream.write(std::move(body), timeout);
-    co_await stream.end(timeout);
+        co_await stream.end(timeout);
+    }
 
     Response response;
     response.head = co_await stream.head(timeout);
@@ -223,6 +231,8 @@ Task<Response> Client::request(std::string method, std::string url, Headers head
 Task<Stream> Client::open(std::string method, std::string url, Headers headers,
                           std::chrono::milliseconds timeout)
 {
+    if (method.empty())
+        throw std::invalid_argument("h2 open: empty method");
     const detail::UrlParts parts = detail::parse_url(url);
     std::shared_ptr<detail::H2Connection> connection = co_await impl_->connection(parts, timeout);
     std::shared_ptr<detail::H2StreamImpl> stream =

@@ -100,6 +100,61 @@ void test_process_streamed_chunked_rejected()
     CHECK(starts_with(response, "HTTP/1.1 400 Bad Request\r\n"));
 }
 
+void test_process_streamed_missing_content_length_rejected()
+{
+    realurl::Server server;
+    server.Post("/stream", [](const auto &req, auto &res) {
+        if (req.body_source)
+            (void)req.body_source->read();
+        res.set_content("ok");
+    }, { .body_mode = realurl::Server::BodyMode::Streamed });
+
+    const std::string response =
+        server.process("POST /stream HTTP/1.1\r\nHost: test\r\n\r\n");
+    CHECK(starts_with(response, "HTTP/1.1 400 Bad Request\r\n"));
+}
+
+void test_process_streamed_zero_content_length()
+{
+    realurl::Server server;
+    server.Post("/stream", [](const auto &req, auto &res) {
+        CHECK(req.body_source != nullptr);
+        if (req.body_source) {
+            auto read_res = req.body_source->read();
+            CHECK(read_res.eof);
+        }
+        res.set_content("ok");
+    }, { .body_mode = realurl::Server::BodyMode::Streamed });
+
+    const std::string response =
+        server.process("POST /stream HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n");
+    CHECK(starts_with(response, "HTTP/1.1 200 OK\r\n"));
+    CHECK(response.find("\r\n\r\nok") != std::string::npos);
+}
+
+void test_process_malformed_content_length_rejected()
+{
+    realurl::Server server;
+    server.Post("/echo", [](const auto &req, auto &res) { res.set_content(req.body); });
+
+    const std::string non_digits =
+        server.process("POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 12abc\r\n\r\n");
+    CHECK(starts_with(non_digits, "HTTP/1.1 400 Bad Request\r\n"));
+
+    const std::string overflow =
+        server.process("POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 999999999999999999999999999999\r\n\r\n");
+    CHECK(starts_with(overflow, "HTTP/1.1 400 Bad Request\r\n"));
+}
+
+void test_process_malformed_target_rejected()
+{
+    realurl::Server server;
+    server.Get("/hello", [](const auto &, auto &res) { res.set_content("world"); });
+
+    const std::string malformed = server.process("GET hello HTTP/1.1\r\nHost: test\r\n\r\n");
+    CHECK(starts_with(malformed, "HTTP/1.1 400 Bad Request\r\n"));
+}
+
 void test_content_type_header()
 {
     realurl::Server server;
@@ -279,6 +334,10 @@ int main()
     test_process_take_over();
     test_process_limits();
     test_process_streamed_chunked_rejected();
+    test_process_streamed_missing_content_length_rejected();
+    test_process_streamed_zero_content_length();
+    test_process_malformed_content_length_rejected();
+    test_process_malformed_target_rejected();
     test_content_type_header();
     test_live_requests();
     return test::summary();

@@ -79,11 +79,49 @@ void test_affinity()
     CHECK(peak.load() > 1);
 }
 
+void test_same_ip_concurrency()
+{
+    boost::asio::io_context io;
+    auto work = boost::asio::make_work_guard(io);
+    std::atomic<int> active{ 0 };
+    std::atomic<int> peak{ 0 };
+    std::atomic<int> completed{ 0 };
+    boost::asio::steady_timer timeout(io, 2s);
+
+    for (int i = 0; i < 4; ++i) {
+        auto gate = realurl::stream_pump_pool().submit(
+            "192.168.1.100",
+            [&] {
+                const int now = ++active;
+                int previous = peak.load();
+                while (previous < now && !peak.compare_exchange_weak(previous, now)) {
+                }
+                std::this_thread::sleep_for(20ms);
+                --active;
+            },
+            io.get_executor());
+
+        gate->async_wait([&] {
+            if (++completed == 4) {
+                timeout.cancel();
+                work.reset();
+            }
+        });
+    }
+
+    timeout.async_wait([&](const boost::system::error_code &) { work.reset(); });
+    io.run();
+
+    CHECK(completed.load() == 4);
+    CHECK(peak.load() > 1);
+}
+
 } // namespace
 
 int main()
 {
     test_completion();
     test_affinity();
+    test_same_ip_concurrency();
     return test::summary();
 }

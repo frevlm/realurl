@@ -290,5 +290,115 @@ int main()
         CHECK(body == "tls /tls");
     }
 
+    {
+        realurl::EventLoop loop;
+        realurl::Client client(loop);
+        bool threw = false;
+        run_task(loop, [&]() -> realurl::Task<void> {
+            try {
+                (void)co_await client.open("", "http://127.0.0.1:8080/x");
+            } catch (const std::invalid_argument &) {
+                threw = true;
+            }
+            loop.stop();
+        });
+        CHECK(threw);
+    }
+
+    {
+        realurl::EventLoop loop;
+        realurl::Client client(loop);
+        bool threw = false;
+        run_task(loop, [&]() -> realurl::Task<void> {
+            try {
+                (void)co_await client.request("GET", "http://127.0.0.1:8080/x", { { "X-Bad\r\nHeader", "value" } });
+            } catch (const std::invalid_argument &) {
+                threw = true;
+            }
+            loop.stop();
+        });
+        CHECK(threw);
+    }
+
+    {
+        std::string received_header;
+        realurl::test::H2TestServer server([&](const realurl::test::H2TestRequest &request) {
+            for (const auto &h : request.headers) {
+                if (h.name == "x-my-header")
+                    received_header = h.value;
+            }
+            realurl::test::H2TestResponse response;
+            response.body = "ok";
+            return response;
+        });
+
+        realurl::EventLoop loop;
+        realurl::Client client(loop);
+        const std::string url = url_for(server, "/hdr");
+        run_task(loop, [&]() -> realurl::Task<void> {
+            try {
+                (void)co_await client.request("GET", url, { { "X-My-Header", "normalized" } }, {}, 2s);
+            } catch (...) {
+            }
+            loop.stop();
+        });
+        CHECK(received_header == "normalized");
+    }
+
+    {
+        realurl::test::H2TestServer server([](const realurl::test::H2TestRequest &) {
+            realurl::test::H2TestResponse response;
+            response.status = 204;
+            return response;
+        });
+
+        realurl::EventLoop loop;
+        realurl::Client client(loop);
+        int status = 0;
+        std::string body;
+        run_task(loop, [&]() -> realurl::Task<void> {
+            try {
+                auto res = co_await client.get(url_for(server, "/204"), 2s);
+                status = res.head.status;
+                body = res.body;
+            } catch (...) {
+            }
+            loop.stop();
+        });
+        CHECK(status == 204);
+        CHECK(body.empty());
+    }
+
+    {
+        realurl::test::H2TestServer server([](const realurl::test::H2TestRequest &request) {
+            realurl::test::H2TestResponse response;
+            response.status = 200;
+            response.body = "ok:" + request.path;
+            return response;
+        });
+
+        realurl::EventLoop loop;
+        realurl::Client client(loop);
+        const std::string url_post = url_for(server, "/upload");
+        const std::string url_get = url_for(server, "/get_after_post");
+        const std::string large_body(65535, 'z');
+
+        int get_status = 0;
+        std::string get_body;
+        run_task(loop, [&]() -> realurl::Task<void> {
+            try {
+                (void)co_await client.request("POST", url_post, {}, large_body, 5s);
+                auto res = co_await client.get(url_get, 5s);
+                get_status = res.head.status;
+                get_body = res.body;
+            } catch (const std::exception &e) {
+                std::fprintf(stderr, "error: %s\n", e.what());
+            }
+            loop.stop();
+        });
+        CHECK(get_status == 200);
+        CHECK(get_body == "ok:/get_after_post");
+    }
+
     return test::summary();
 }

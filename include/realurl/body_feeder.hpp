@@ -72,6 +72,19 @@ public:
         return limit_exceeded_.load(std::memory_order_acquire);
     }
 
+    /// Inactivity timeout for reading request body chunks.
+    /// If no bytes are received for this duration, run() terminates.
+    /// Default is 60s; 0 disables the inactivity check.
+    void set_idle_timeout(std::chrono::milliseconds timeout)
+    {
+        idle_timeout_ = timeout;
+    }
+
+    std::chrono::milliseconds idle_timeout() const
+    {
+        return idle_timeout_;
+    }
+
     /// Build a BodySource backed by this feeder.  Call before starting run().
     std::shared_ptr<BodySource> make_source();
 
@@ -98,6 +111,7 @@ private:
     bool cancelled_ = false;
     long long body_limit_bytes_ = 0;
     std::atomic<bool> limit_exceeded_{ false };
+    std::chrono::milliseconds idle_timeout_{ 60000 };
     std::shared_ptr<BodySource> source_;
 };
 
@@ -214,6 +228,7 @@ inline void BodyFeeder::feed_initial(std::string_view bytes)
 
 inline void BodyFeeder::run(int fd)
 {
+    auto last_active = std::chrono::steady_clock::now();
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(mu_);
@@ -234,8 +249,13 @@ inline void BodyFeeder::run(int fd)
                 continue;
             break;
         }
-        if (rc == 0)
+        if (rc == 0) {
+            if (idle_timeout_.count() > 0 &&
+                std::chrono::steady_clock::now() - last_active >= idle_timeout_) {
+                break;
+            }
             continue; // poll timeout — re-check cancel
+        }
 
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -252,6 +272,7 @@ inline void BodyFeeder::run(int fd)
             continue;
         if (n <= 0)
             break; // EOF or read error (the block returns to the pool)
+        last_active = std::chrono::steady_clock::now();
         chunk.size = static_cast<size_t>(n);
 
         // Streaming body-size accounting: the count is global across

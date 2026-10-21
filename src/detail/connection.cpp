@@ -1,6 +1,7 @@
 #include "realurl/detail/connection.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -476,7 +477,7 @@ void H2StreamImpl::on_headers(HeaderList &&headers, bool end_stream)
             complete_head(head_waiter_);
     }
 
-    if (end_stream) {
+    if (end_stream || head_result_.status == 204 || head_result_.status == 304) {
         remote_closed_ = true;
         if (read_waiter_ != nullptr && recv_pending_ == 0) {
             if (read_waiter_->n_ == 0)
@@ -723,6 +724,10 @@ void H2Connection::send_preface()
 std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::string_view path, HeaderList headers,
                                                  bool end_stream)
 {
+    if (method.empty())
+        throw std::invalid_argument("h2 open: empty method");
+    if (path.empty() || path[0] != '/')
+        throw std::invalid_argument("h2 open: path must begin with /");
     if (!usable_)
         throw std::system_error(ENOTCONN, std::generic_category(), "h2 connection is not usable");
     if (streams_.size() >= max_streams_)
@@ -732,6 +737,10 @@ std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::s
     next_stream_id_ += 2;
 
     auto stream = std::make_shared<H2StreamImpl>(*this, id, peer_initial_window_);
+    if (end_stream) {
+        stream->local_closed_ = true;
+        stream->end_sent_ = true;
+    }
     streams_.emplace(id, stream);
 
     HeaderList block;
@@ -743,9 +752,20 @@ std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::s
     for (HeaderField &header : headers) {
         if (header.name.empty() || header.name[0] == ':')
             continue;
-        if (is_connection_header(header.name))
+        std::string lower_name;
+        lower_name.reserve(header.name.size());
+        for (char c : header.name) {
+            if (c == '\r' || c == '\n' || c == '\0')
+                throw std::invalid_argument("h2 open: header name contains control character");
+            lower_name.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        if (is_connection_header(lower_name))
             continue;
-        block.push_back(std::move(header));
+        for (char c : header.value) {
+            if (c == '\r' || c == '\n' || c == '\0')
+                throw std::invalid_argument("h2 open: header value contains control character");
+        }
+        block.push_back({ std::move(lower_name), std::move(header.value) });
     }
 
     std::string encoded;
@@ -906,15 +926,23 @@ Task<void> H2Connection::writer_loop()
         reap();
 
         constexpr std::size_t kMaxBatchWriteSize = 512 * 1024;
-        while (!write_queue_.empty() && send_window_ > 0 && write_buffer_.size() < kMaxBatchWriteSize) {
+        while (!write_queue_.empty() && write_buffer_.size() < kMaxBatchWriteSize) {
             const std::uint32_t id = write_queue_.front();
-            write_queue_.pop_front();
 
             auto it = streams_.find(id);
-            if (it == streams_.end() || it->second == nullptr)
+            if (it == streams_.end() || it->second == nullptr) {
+                write_queue_.pop_front();
                 continue;
+            }
 
             auto &stream = it->second;
+            // 0-byte DATA frames (such as empty frames carrying END_STREAM) are not subject
+            // to flow control per RFC 7540 §6.1. Only break if this stream has actual data payload
+            // to send and the connection send window is depleted.
+            if (stream->send_pending() > 0 && send_window_ <= 0)
+                break;
+
+            write_queue_.pop_front();
             stream->in_write_queue_ = false;
 
             if (stream->done())

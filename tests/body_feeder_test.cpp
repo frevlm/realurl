@@ -83,6 +83,28 @@ void test_body_limit()
     CHECK(!result.eof);
 }
 
+void test_idle_timeout()
+{
+    int fds[2] = { -1, -1 };
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    realurl::BufferPool pool(4);
+    auto feeder = std::make_shared<realurl::BodyFeeder>(&pool);
+    feeder->set_idle_timeout(std::chrono::milliseconds(250));
+    auto source = feeder->make_source();
+
+    std::thread reader([feeder, fd = fds[0]] { feeder->run(fd); });
+
+    // Leave socket open without sending anything: feeder should detect inactivity and terminate!
+    reader.join();
+
+    auto result = source->read();
+    CHECK(result.eof);
+
+    CHECK(::close(fds[0]) == 0);
+    CHECK(::close(fds[1]) == 0);
+}
+
 } // namespace
 
 int main()
@@ -90,5 +112,6 @@ int main()
     test_initial_bytes();
     test_socket_feed();
     test_body_limit();
+    test_idle_timeout();
     return test::summary();
 }
