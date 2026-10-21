@@ -67,8 +67,7 @@ void StreamPumpPool::shutdown()
     threads_.clear();
 }
 
-std::shared_ptr<StreamGate> StreamPumpPool::submit(std::string_view /*client_ip*/, std::function<void()> task,
-                                                   boost::asio::any_io_executor io_ex)
+std::shared_ptr<StreamGate> StreamPumpPool::submit(std::function<void()> task, boost::asio::any_io_executor io_ex)
 {
     auto gate = StreamGate::create(std::move(io_ex));
     {

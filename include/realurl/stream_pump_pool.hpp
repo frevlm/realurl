@@ -13,8 +13,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <string>
-#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -96,19 +94,17 @@ template <typename CompletionToken> auto async_wait_gate(std::shared_ptr<StreamG
 /// Bounded pool of long-lived pump threads.
 ///
 /// Each thread owns a persistent TLS CurlMultiPool (via upstream.cpp), so
-/// upstream connections are reused across the streams it processes.  Streams
-/// are hashed by client ip to a fixed thread, matching the nginx
-/// `upstream-hash-by: $binary_remote_addr` deployment so a client's streams
-/// consistently reuse one upstream connection.
+/// upstream connections are reused across the streams it processes.  Tasks
+/// share one global FIFO queue and run on whichever worker is free: no client
+/// or IP is pinned to a thread or serialized behind another stream.
 class StreamPumpPool {
 public:
     static StreamPumpPool &instance();
 
-    /// Run `task` on a dedicated pump thread (affinity by client_ip).
-    /// Returns a gate that the connection coroutine co_awaits; the gate is
-    /// finished automatically when the task returns or throws.
-    std::shared_ptr<StreamGate> submit(std::string_view client_ip, std::function<void()> task,
-                                       boost::asio::any_io_executor io_ex);
+    /// Run `task` on a pump thread.  Returns a gate that the connection
+    /// coroutine co_awaits; the gate is finished automatically when the task
+    /// returns or throws.
+    std::shared_ptr<StreamGate> submit(std::function<void()> task, boost::asio::any_io_executor io_ex);
 
     size_t size() const
     {

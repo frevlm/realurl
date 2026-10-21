@@ -724,7 +724,6 @@ struct Server::Impl {
             ClientWriter writer = client_writer_from_fd(stream.socket().native_handle(), impl->client_write_timeout,
                                                         response_started);
             auto gate = stream_pump_pool().submit(
-                request.remote_addr,
                 [task = response.take_over_task(), &writer]() mutable { task(writer); },
                 stream.get_executor());
             co_await async_wait_gate(gate, net::use_awaitable);
