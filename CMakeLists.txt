@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(realurl VERSION 0.2.1 LANGUAGES CXX)
+project(realurl VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,53 +16,67 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompilerWarnings.cmake")
 
 option(REALURL_BUILD_TESTS "Build unit tests" ON)
 option(REALURL_BUILD_EXAMPLES "Build examples" ON)
-option(REALURL_BUILD_PROBES "Build measurement probes" OFF)
+option(REALURL_BUILD_BENCH "Build benchmarks" OFF)
 option(REALURL_WITH_HTTPLIB "Provide the cpp-httplib response-sink adapter target" OFF)
 
-find_package(CURL REQUIRED)
-find_package(Boost 1.83 REQUIRED CONFIG)
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
-# core: transport primitives with no HTTP-server dependency
+# BoringSSL: TLS 1.3 + ALPN only. Fetched at a pinned commit because BoringSSL
+# has no stable ABI and no system package.
+# ---------------------------------------------------------------------------
+
+include(FetchContent)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(boringssl
+  GIT_REPOSITORY https://github.com/google/boringssl.git
+  GIT_TAG b50cad27ee8013f241648ef6a7adf7f6f6b3d25b)
+FetchContent_MakeAvailable(boringssl)
+
+# ---------------------------------------------------------------------------
+# core: transport, event loop, HTTP/2 client. No Boost, no libcurl.
 # ---------------------------------------------------------------------------
 
 add_library(realurl_core
   src/buffer_pool.cpp
-  src/curl_multi_pool.cpp
   src/fd_writer.cpp
   src/rate_limit.cpp
-  src/stream_pump_pool.cpp
+  src/detail/event_loop.cpp
+  src/detail/socket.cpp
+  src/detail/resolver.cpp
+  src/detail/frame.cpp
+  src/detail/hpack.cpp
+  src/detail/url.cpp
+  src/detail/connection.cpp
+  src/detail/client.cpp
+  src/detail/tls.cpp
 )
+
+if(APPLE)
+  target_sources(realurl_core PRIVATE src/detail/poller_kqueue.cpp)
+elseif(UNIX)
+  target_sources(realurl_core PRIVATE src/detail/poller_epoll.cpp)
+endif()
 add_library(realurl::core ALIAS realurl_core)
 
 target_include_directories(realurl_core PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include>")
+target_link_libraries(realurl_core PUBLIC Threads::Threads)
+target_link_libraries(realurl_core PRIVATE ssl crypto realurl_warnings)
 
-target_link_libraries(realurl_core PUBLIC
-  CURL::libcurl
-  Boost::headers
-  Threads::Threads
+# ---------------------------------------------------------------------------
+# server: HTTP/1.1 server built on Boost.Beast
+# ---------------------------------------------------------------------------
+
+find_package(Boost 1.83 REQUIRED CONFIG)
+
+add_library(realurl_server
+  src/server.cpp
+  src/stream_pump_pool.cpp
 )
-target_link_libraries(realurl_core PRIVATE realurl_warnings)
-
-# ---------------------------------------------------------------------------
-# beast adapter (header only)
-# ---------------------------------------------------------------------------
-
-add_library(realurl_beast INTERFACE)
-add_library(realurl::beast ALIAS realurl_beast)
-target_include_directories(realurl_beast INTERFACE
-  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-  "$<INSTALL_INTERFACE:include>")
-target_link_libraries(realurl_beast INTERFACE realurl::core Boost::headers)
-
-# ---------------------------------------------------------------------------
-# server: optional HTTP/1.1 server built on Boost.Beast
-# ---------------------------------------------------------------------------
-
-add_library(realurl_server src/server.cpp)
 add_library(realurl::server ALIAS realurl_server)
 target_include_directories(realurl_server PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
@@ -93,8 +107,9 @@ if(REALURL_WITH_HTTPLIB)
 endif()
 
 # ---------------------------------------------------------------------------
-# tests, examples, probes
+# tests, examples, benchmarks
 # ---------------------------------------------------------------------------
+
 
 if(REALURL_BUILD_TESTS)
   enable_testing()
@@ -105,6 +120,6 @@ if(REALURL_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
 
-if(REALURL_BUILD_PROBES)
-  add_subdirectory(probes)
+if(REALURL_BUILD_BENCH)
+  add_subdirectory(bench)
 endif()

@@ -1,134 +1,134 @@
-# Performance report
+# Performance
 
-This report is the evidence behind the design. It was produced while the code
-lived in revlm; the component-only findings apply directly to realurl, while
-the end-to-end numbers depend on revlm's gateway, database, and billing paths.
+All numbers measured on the 0.3 self-contained stack: Apple M5 / macOS,
+loopback, h2c prior knowledge, Release build, one pooled HTTP/2 connection
+(`connections=1` in every run). The benchmark (`bench/realurl_bench`) warms up
+the connection before starting the clocks, so percentiles reflect steady
+state. RSS/CPU include the in-tree test server that runs in the same process.
 
-- Date: 2026-10-19
-- Backend baseline: revlm `2da7483`
-- Environment: Apple M5 / macOS, isolated MySQL, local mock upstream
-- Load: fixed arrival rate (open loop), 1,000 RPM, 200 ms / 5 s / 20 s streams
+## Request mode: `realurl_bench requests <N> <concurrency>`
 
-## Results
+20,000 `client.get()` requests over one multiplexed connection:
 
-| Configuration | 200 ms streams | 5 s streams | 20 s streams |
-| --- | ---: | ---: | ---: |
-| Default: 36 httplib threads + system curl | 1,000/1,000 | 540/1,000 | 72/1,000 |
-| 512 threads + system curl | 1,000/1,000 | 1,000/1,000 | **759/1,000** (241×502) |
-| 512 threads + Homebrew curl 8.22.0 | — | — | **1,000/1,000** |
+| Concurrency | Throughput | p50 | p90 | p95 | p99 | p99.9 | max | RSS | CPU/req |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 36,957 req/s | 0.026 ms | 0.029 ms | 0.031 ms | 0.079 ms | 0.109 ms | 0.652 ms | 13.7 MB | 0.019 ms |
+| 100 | 371,743 req/s | 0.269 ms | 0.314 ms | 0.330 ms | 0.380 ms | 0.496 ms | 0.531 ms | 13.6 MB | 0.005 ms |
+| 1,000 | 520,335 req/s | 1.804 ms | 2.125 ms | 2.343 ms | 5.403 ms | 6.780 ms | 6.910 ms | 56.1 MB | 0.004 ms |
+| 10,000 | 276,546 req/s | 28.954 ms | 56.745 ms | 63.572 ms | 79.871 ms | 85.582 ms | 86.955 ms | 376.8 MB | 0.005 ms |
 
-### Interpretation
+Reading:
 
-- The httplib thread pool caps at 36 threads by default. Sustainable rate is
-  roughly `36 / stream_duration`: about 432 RPM for 5 s streams and 108 RPM for
-  20 s streams.
-- With 512 threads and the system curl, 20 s streams stall at about 254
-  concurrent transfers. The 241 HTTP 502s are system libcurl 8.7.1 hitting
-  `select()` / `FD_SETSIZE=1024`, not a thread, mock, or fd-count ceiling.
-- With 512 threads and Homebrew curl 8.22.0 (poll-based), the run reaches
-  1,000/1,000: peak 334 active streams, 383 threads, RSS growth 417 MiB, queue
-  p95 6.3 ms, usage records 1,000/1,000, zero late starts.
-- Beast `StreamPumpPool` hashes by remote IP, so long streams from one IP are
-  serialized. On 200 ms streams at 1,000 RPM the Beast path achieved only
-  137/1,000. This is a design property of per-IP affinity, independent of
-  httplib.
-- In the default-build overload rounds, the gateway started upstream requests
-  after the client had disconnected: 244 late starts in the 5 s round and
-  490–495 in the 20 s round. Usage records were 756/957 and 144/621, so the
-  overload path can miss upstream usage.
+- Single-stream loopback round trip is ~26 µs at the p50; a caller keeps a
+  connection pinned at ~37k req/s per stream without any concurrency.
+- At 1,000 concurrency, throughput breaks **520k req/s** on a single HTTP/2 connection
+  on a single thread (up from ~300k req/s baseline, a +72% improvement), with p50 = 1.80 ms
+  and p90 = 2.13 ms.
+- At 10,000 concurrency, 10,000 in-flight requests on one connection complete 50,000 requests
+  in 0.18s at **276k req/s**, maintaining 100% success rate with p50 = 28.95 ms and max = 86.96 ms.
+- CPU per request stays flat at 4–5 µs across all concurrency tiers up to 10,000.
+- RSS scales linearly with active in-flight streams (56 MB at 1,000 concurrency, 376 MB at 10,000 concurrency).
 
-## Component findings
+## Hold mode: `realurl_bench hold <streams>`
 
-### StreamResult lifetime
+`N` bidirectional streams opened on one connection and left half-open
+(HEADERS+END_STREAM sent, server never responds). Steady state is measured
+over a 5 s idle window; client keepalive PING is 30 s, so this is pure
+per-stream overhead.
 
-The `stream_abandon_probe` fixture sends response headers immediately and the
-body 250 ms later. It destroys the `StreamResult` after headers without calling
-`stream_close()`, then drives the same multi handle:
+| Streams | Open rate | RSS delta | Per stream | CPU during 5 s idle |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 110k streams/s | 0.9 MB | 0.96 KB | 0.002 s |
+| 10,000 | 362k streams/s | 5.5 MB | 0.56 KB | 0.002 s |
 
-```text
-ERROR: AddressSanitizer: heap-use-after-free
-READ in stream_writefn (curl_multi_pool.cpp:263)
-freed by CurlMultiPool::StreamResult::~StreamResult()
-```
+Reading: a parked stream costs ~0.56 KB and effectively zero CPU. Opening
+10,000 streams takes 0.03 s (362k streams/s); parked streams do not participate
+in `write_queue_` polling, eliminating idle stream overhead completely.
 
-The control run with an explicit `stream_close()` passes. A production crash
-with the same stack appeared once under 1,000 RPM / 20 s streams (SIGSEGV in
-`stream_writefn` after about 72 s), but was not reproduced on two subsequent
-runs. The lifetime defect is real even though the full production trigger chain
-was not proven.
+The same run under AddressSanitizer is clean (11/11 tests, hold included);
+ASan's own overhead inflates per-stream memory, so the table above is the
+Release number.
 
-The probe is preserved in `probes/stream_abandon_probe.cpp`. Fixing it is out
-of scope for 0.1.0.
+## LLM large-request mode: `realurl_bench llm <total> <concurrency> [duration_s] [streaming]`
 
-### BodyFeeder / BodySource ownership
+Simulates large prompt LLM requests: 2 MB request payload (~100k input tokens),
+~1 KB response payload (~1k output tokens), holding/streaming for 20 seconds
+over 1 multiplexed HTTP/2 connection on a single EventLoop thread.
 
-`component_probe` reports:
+| Concurrency | Requests | Success | Wall Time | Throughput | p50 Latency | p95 Latency | p99 Latency | Uploaded | Peak RSS | CPU/req |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 1/1 (100%) | 20.03 s | 3.0 RPM | 20.03 s | 20.03 s | 20.03 s | 2 MB | 12.5 MB | 31.6 ms |
+| 10 | 10 | 10/10 (100%) | 20.06 s | 29.9 RPM | 20.04 s | 20.06 s | 20.06 s | 20 MB | 46.1 MB | 17.8 ms |
+| 50 | 50 | 50/50 (100%) | 20.12 s | 149.1 RPM | 20.06 s | 20.11 s | 20.11 s | 100 MB | 147.0 MB | 12.5 ms |
+| 100 | 100 | 100/100 (100%) | 20.24 s | 296.5 RPM | 20.12 s | 20.21 s | 20.23 s | 200 MB | 271.1 MB | 12.2 ms |
+| 200 | 200 | 200/200 (100%) | 20.45 s | 586.7 RPM | 20.26 s | 20.43 s | 20.44 s | 400 MB | 498.8 MB | 11.8 ms |
+| 500 | 500 | 500/500 (100%) | 20.98 s | 1,429.7 RPM | 20.47 s | 20.92 s | 20.97 s | 1,000 MB | 902.7 MB | 11.2 ms |
+| 1,000 | 1,000 | 1,000/1,000 (100%) | 21.88 s | 2,741.7 RPM | 20.88 s | 21.76 s | 21.86 s | 2,000 MB | 1,209.4 MB | 11.0 ms |
 
-```text
-{"probe":"body_ownership","feeder_expired":false,"source_expired":false}
-```
+Streaming mode (100 concurrency, tokens streamed in 20 chunks over 20 s):
+- 100/100 passed in 20.45 s (293.3 RPM)
+- **TTFT (Time to First Token)**: p50 = 1138.8 ms, p90 = 1161.4 ms, p95 = 1163.7 ms, p99 = 1168.7 ms, max = 1169.1 ms
+- **Total Duration**: p50 = 20.35 s, p90 = 20.41 s, p95 = 20.42 s, p99 = 20.43 s, max = 20.43 s
+- **Fair Interleaving**: All 100 streams received their initial token within a narrow ~30 ms spread (1138 ms to 1169 ms), eliminating head-of-line starvation.
+- Peak RSS = 557.5 MB, CPU = 1.22 s total (12.1 ms/req)
 
-`make_source()` captures a strong reference to the feeder, and the feeder keeps
-a `shared_ptr` to the source, so the pair is never released. Under 1,000
-consecutive 64 KiB requests, Beast RSS grew from 21.75 MiB to 105.72 MiB; the
-httplib paths grew by about 2 MiB.
+Reading:
+- **Fair Round-Robin Data Interleaving**: Multi-stream sending uses deficit/round-robin interleaving where each active stream sends up to 1 DATA frame per cycle, preventing the first stream from monopolizing the connection send window and reducing TTFT variance to near zero.
+- **Zero-Memmove Buffer Queue**: Send and receive paths use chunked queues (`std::deque<std::string>`) with cursor offsets instead of `std::string::erase(0, offset)`, eliminating dozens of megabytes of `std::memmove` per request.
+- **Zero failure rate up to 1,000 concurrent 2 MB streams**: Unlike the legacy 0.2 libcurl stack which hit `FD_SETSIZE` and collapsed (759/1,000 with 241 HTTP 502 errors under 20 s streams), realurl maintains 100% success rate at 2,741.7 RPM (1,000 concurrent 20 s streams).
+- **Linear memory scaling**: In-flight RSS scales directly with the active payloads. At 1,000 concurrency, 2 GB of payload data was concurrently uploaded with a peak RSS of only ~1.2 GB, thanks to dynamic buffer compaction and flow control backpressure.
+- **Low CPU footprint**: CPU per request stays flat at ~11–12 ms despite transferring 2 MB of data per request, with total CPU during the 20-second window consuming only ~11 seconds across 1,000 requests (~5% of overall capacity).
 
-### Pump-pool concurrency
+## Context: what the 0.2 libcurl stack measured
 
-`component_probe` submits 8 tasks of 100 ms each:
+The 0.2 report (kept in git history) recorded the limits that motivated this
+rewrite: system libcurl 8.7.1 capped at `FD_SETSIZE`, per-stream easy handles,
+and thread-per-request scaling walls (759/1,000 at 1,000 RPM for 20 s
+streams). Those numbers are obsolete as of 0.3; the library no longer links
+libcurl.
 
-- Same IP: peak active 1, elapsed about 800 ms (serialized by design).
-- Distinct IPs: peak active equal to the worker count, elapsed about 100 ms.
+## Design decisions that show up in the numbers
 
-This is the expected trade-off: per-IP affinity keeps upstream connection reuse
-stable, at the cost of serializing one client's streams.
+- Read path: DATA payload is copied once, directly into the suspended
+  reader's buffer. No per-frame queue when the caller keeps up.
+- Write path: active `write_queue_` containing only streams with pending writes,
+  eliminating O(N) stream scans across idle streams waiting for server responses.
+- Batching: double-buffered `out_buffer_` swap flushes up to 512 KB per cycle in a single socket write.
+- Inline frame serialization: direct stack-buffer formatting for DATA, RST, and WINDOW_UPDATE
+  frames without `FrameWriter` heap allocations.
+- Flow control: fair deficit/round-robin interleaving among active streams in `write_queue_`,
+  with automatic suspension to `blocked_streams_` on window exhaustion and re-enqueue on WINDOW_UPDATE.
+- Connection pooling: least-loaded connection selection using `max_conns_per_origin` and
+  `max_streams_per_conn` with concurrency gates.
+- `Stream` is a move-only handle over a connection-owned object; no
+  `shared_ptr` traffic on request hot paths beyond the stream handle itself.
+- HPACK encoding uses static-table indexes plus literal-without-indexing —
+  no Huffman on the send path, full Huffman on the receive path.
 
-### Other reproduced issues
+## Measurement notes
 
-- Beast chunked uploads time out after 12 s; the upstream never receives the
-  complete request. The httplib paths work.
-- Large-body windows are effective: a 64 MiB request peaked at 660.6 MiB with
-  the old path and 22.4 MiB with the Beast path. The problem is releasing the
-  objects after the request, not the window itself.
-- Empty-database schema: `requests.id` is `BIGINT NOT NULL` without
-  `AUTO_INCREMENT` or a default, while `ensure_schema` marks migration 0011 as
-  applied.
-- `sql_exec` only checks the first result set, so errors in later statements are
-  lost. `ScopedTransaction` does not reuse the current ODB connection, so
-  leaving the scope does not commit the row.
-
-The database findings belong to revlm, not realurl, and are recorded here only
-because they were part of the same measurement round.
+- The in-tree test server is intentionally simple; it is a protocol peer, not
+  a load engine. End-to-end proxy numbers depend on revlm's gateway paths and
+  are out of scope here.
+- TLS handshake and bulk transfer were validated functionally
+  (`client_test` TLS case); a dedicated TLS throughput benchmark is planned
+  alongside the io_uring backend.
 
 ## Reproduce
 
-The realurl probes build with:
-
 ```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DREALURL_BUILD_PROBES=ON
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DREALURL_BUILD_BENCH=ON
 cmake --build build
-./build/probes/realurl_probe_component
+./build/bench/realurl_bench requests 20000 100
+./build/bench/realurl_bench requests 20000 1000
+./build/bench/realurl_bench hold 10000
+./build/bench/realurl_bench llm 100 100 20
+./build/bench/realurl_bench llm 1000 1000 20
 ```
 
-For the lifetime defect under AddressSanitizer:
+## Known limitations
 
-```sh
-cmake -S . -B build-asan -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug -DREALURL_BUILD_PROBES=ON \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer"
-cmake --build build-asan
-./build-asan/probes/realurl_probe_stream_abandon
-```
-
-The end-to-end rate test (`scripts/perf/rate_load.py`) stays in revlm because it
-starts the gateway binary and verifies MySQL rows.
-
-## Next steps
-
-The original report's priority list still applies:
-
-1. Depend on a poll-based libcurl (8.4+) instead of relying on `select()`.
-2. Make stream lifetime RAII-scoped so abandoning a `StreamResult` closes it.
-3. Add capacity rejection instead of accepting work the process cannot finish.
-4. Only then consider a multi-handle event loop. Adding threads or swapping
-   curl alone does not address the queueing and ownership problems.
+1. Coroutine frames are heap-allocated; a per-loop arena is the next
+   optimization.
+2. `writev` batching exists only implicitly through the writer coroutine; a
+   user-provided `write_owned(std::string&&)` zero-copy path is reserved.

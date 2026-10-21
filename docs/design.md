@@ -1,103 +1,111 @@
 # Design
 
-This document describes the data structures and threading model. The behavior is intentionally the same as the implementation extracted from revlm; the performance report in `performance.md` explains why each piece exists.
-
-## Data flow
-
-A streaming proxy request involves four moving parts:
-
-```text
-client socket ──► BodyFeeder ──► BodySource ──► curl READFUNCTION ──► upstream
-                                                                        │
-client socket ◄── ClientWriter ◄── ResponseSink ◄── curl WRITEFUNCTION ◄┘
-```
-
-- `BodyFeeder` reads the client body on its own thread into a bounded queue of 64 KiB blocks borrowed from `BufferPool`.
-- `BodySource` exposes `read()`, `consume()`, `peek()`, and `wake()` to the curl read callback.
-- `CurlMultiPool` owns one `CURLM*` per thread and attaches one easy handle per in-flight stream.
-- `ClientWriter` writes response bytes to the client fd with a deadline.
-- `ResponseSink` lets the same gateway code write to a Beast stream, a cpp-httplib response, or any other server.
-
-## Core data structures
-
-### `BodySource`
-
-A pull-based window with four callbacks:
-
-| Callback | Semantics |
-| --- | --- |
-| `read()` | Return the next unconsumed bytes, or `{wait:true}`, or `{eof:true}`. Does not advance the cursor. |
-| `consume(n)` | Advance the cursor after the consumer copied `n` bytes. |
-| `peek()` | Copy the retained prefix (used for request inspection before the body is fully consumed). |
-| `wake()` | Called by the producer after appending bytes; the curl owner thread performs `curl_easy_pause(CURLPAUSE_CONT)`. |
-
-Keeping `read` and `consume` separate means the curl callback can copy directly out of the pool block without an intermediate buffer or a second allocation.
-
-### `CurlRequest` / `CurlResponse`
-
-`CurlRequest` is a value object. The pool never retains it; every callback and the body source must stay alive for the duration of `execute()` or `execute_stream()`. The fields are grouped by concern:
-
-- request line and headers,
-- body production (`initial_body_chunk`, `content_length`, `body_source`),
-- response consumption (`on_headers`, `on_response_chunk`),
-- four timeouts (connect, upload-stall, header, total),
-- security (`dns_pin`),
-- optional upload rate flow.
-
-### `CurlMultiPool::StreamResult`
-
-The result of `execute_stream()` contains the status, headers, any bytes that arrived before headers completed (`initial_body`), and four callable handles: `stream_read`, `stream_error`, `stream_error_message`, `stream_close`.
-
-The returned object is a *view* over shared state. It is copyable, but all copies refer to the same transfer. `stream_close()` must be called on the owning thread before the last copy is destroyed; see the known limitations in the README.
-
-### `BufferPool`
-
-A fixed-capacity free list of 64 KiB blocks. `borrow()` returns a `unique_ptr<char[]>` whose deleter returns the block to the pool. When the free list is empty, `borrow()` allocates an emergency block that is deleted directly. The pool must outlive every borrowed buffer.
-
-### `UploadRateLimiter`
-
-A process-wide coordinator implementing a two-pool bandwidth allocation:
-
-- Flows are classified once at join time by `Content-Length`: at or above `classify_bytes` → limited pool; below → normal pool; unknown → limited.
-- Every limited flow receives a cap from its first byte, because applying `CURLOPT_MAX_SEND_SPEED_LARGE` mid-transfer stalls curl for several seconds.
-- A 200 ms tick computes `backlog = Σ remaining normal bytes`, then allocates the remaining pipe budget across limited flows.
-- Down-scaling is capped at 2× per tick and skips flows that made no progress, avoiding cascading stalls.
-
-The owner thread applies the cap; the coordinator only stores an atomic target.
-
-### `StreamPumpPool`
-
-A bounded pool of long-lived worker threads. Tasks are hashed by client IP to a fixed worker so a client's streams reuse the same thread-local `CurlMultiPool` and therefore the same upstream connections.
-
-`StreamGate` is the completion primitive: the pump thread calls `finish()`, which posts the registered callback back onto the connection's asio executor. The connection coroutine awaits the gate instead of blocking an io thread for the stream duration.
+The 0.3 architecture. The behavior of the HTTP/2 client is specified by
+`include/realurl/http2.hpp`; this document describes the layers underneath.
 
 ## Threading model
 
-| Thread | Owns | May touch |
+One `EventLoop` per thread. Everything the hot path touches — socket
+readiness, timers, coroutine resumption, HPACK state, flow-control windows —
+lives on the loop thread and takes no locks. `EventLoop::post()` is the only
+cross-thread entry point (mutex + swap + eventfd/EVFILT_USER wakeup) and it is
+not on the request path.
+
+A `Client` and every connection it creates belong to one loop. Connections are
+never shared between loops; `SSL_CTX` (via `TlsContext`) is the only shared
+TLS object because BoringSSL guarantees its thread safety.
+
+## Coroutine core
+
+`Task<T>` is a cold coroutine with symmetric transfer: awaiting a child stores
+the parent handle in the child's promise, and the child's final suspend
+transfers straight back to the parent. A top-level task (spawned via
+`EventLoop::spawn`) destroys its own frame on completion.
+
+IO awaits use an in-frame awaiter registered with the poller as a plain
+callback pointer. Completions are never resumed inside the poll batch: the
+callback pushes the handle into a ready list, and the loop resumes the batch
+after polling. That keeps poller registrations from mutating mid-iteration and
+gives one well-defined resume point per await.
+
+Timeouts are loop timers captured by the awaiter; whichever of IO/timer fires
+first completes the awaiter and both paths are idempotent (`done` flag).
+
+## Event loop
+
+| Platform | Backend | Wakeup |
 | --- | --- | --- |
-| Connection io thread | `BeastResponseSink`, asio socket | server-side read/write, gate registration |
-| Body feeder thread | client fd read side | `BodyFeeder` queue, `BodySource::wake` |
-| Pump worker thread | `CurlMultiPool` (thread-local), easy handles | curl handles, rate flow cap, `ClientWriter` |
-| Rate coordinator | mutex-protected flow map | atomic targets only |
+| Linux | `epoll_create1` + `EPOLLONESHOT`-free level trigger | `eventfd` |
+| macOS | `kqueue` + `EVFILT_READ/WRITE` | `EVFILT_USER` |
 
-No easy handle is touched from more than one thread. The only cross-thread curl operation is `curl_multi_wakeup()`, which is explicitly thread-safe.
+Timer wheel is a `priority_queue` with lazy cancellation (`TimerId` set).
+`run_once()` order: posted callbacks → due timers → poll (timeout clamped to
+the nearest timer, 0 when coroutines are already ready) → dispatch events →
+resume ready batch.
 
-## Timeout model
+## HTTP/2 engine
 
-Four independent segments prevent one failure mode from masking another:
+### Frames
 
-| Segment | curl option / mechanism | Default |
-| --- | --- | --- |
-| Connect | `CURLOPT_CONNECTTIMEOUT` | 5 s |
-| Upload stall | `CURLOPT_LOW_SPEED_LIMIT` + `CURLOPT_LOW_SPEED_TIME` | 10 KB/s for 30 s |
-| Response headers | `drive_until_headers()` deadline | 120 s |
-| Inter-event idle | `stream_read(..., idle_timeout_ms)` | caller-provided |
-| Total transfer | `CURLOPT_TIMEOUT` | disabled (0) |
+`FrameParser` validates the 9-byte header, enforces `max_frame_size`, and
+returns views into the read buffer (zero-copy framing). `FrameWriter` appends
+encoded frames to the connection's outbound buffer. HEADERS exceeding the
+frame limit are split into CONTINUATION frames; the reader enforces that no
+other frame type may appear inside a header sequence.
 
-A wall-clock total timeout is disabled by default because a large body that keeps making progress should not be killed. The upload-stall and idle segments handle stuck transfers instead.
+### HPACK
 
-## Why per-thread multi handles
+The decoder is complete: 61-entry static table, dynamic table with size
+updates, Huffman decoding (tree built once from the RFC 7541 Appendix B
+table), padding/EOS validation, and a header-list size cap. The encoder uses
+static-table indexes and literal-without-indexing representations; sensitive
+fields (`authorization`, `cookie`, `set-cookie`) use never-indexed. This is
+valid HPACK with predictable CPU; Huffman emission is a later optimization.
 
-A `curl_multi` handle caches connections. Creating one multi handle per stream prevents reuse and forces a new TCP/TLS handshake for every request. Creating one shared multi handle requires serializing access, because easy handles and multi handles are not thread-safe.
+The RFC 7541 C.3, C.4, and C.6 example sequences run verbatim in
+`tests/hpack_test.cpp`; the interop test (`tests/interop/h2server.go`) then
+cross-checks the decoder against a real Go server, which emits Huffman-coded
+headers.
 
-Per-thread multi handles split the difference: each thread reuses its own connections, and streams never contend on a shared curl lock. `StreamPumpPool` then pins a client's streams to one thread, which keeps connection reuse stable across requests.
+### Streams
+
+Each stream is a connection-owned object with:
+
+- a bounded send buffer (256 KiB high water) compacted by offset,
+- receive window accounting: consumed bytes are returned with WINDOW_UPDATE
+  only while the receive buffer is below 1 MiB, which is the TCP-style
+  backpressure for slow readers,
+- one suspended reader/writer/head/end awaiter each (single-consumer per
+  direction), completed at most once.
+
+### Connection
+
+Two coroutines per connection:
+
+- **Reader**: fills a 64 KiB buffer, parses frames, dispatches to streams,
+  returns connection-level flow-control credit. On any protocol violation the
+  connection sends GOAWAY with the matching error code and tears down.
+- **Writer**: waits on a flush signal, pumps every stream's send buffer into
+  DATA frames bounded by both windows, and issues one socket write per batch.
+
+`SETTINGS` deltas (`INITIAL_WINDOW_SIZE`) are applied to every stream,
+including negative deltas. `GOAWAY` fails streams above `last_stream_id` and
+drains the rest. RST_STREAM and stream completion always return flow-control
+credit correctly and wake every suspended waiter exactly once.
+
+### Pool
+
+`ClientImpl` keeps, per origin key (`scheme://authority` plus pinned IP), up
+to `Config::max_conns_per_origin` connections. Selection prefers the
+connection with the fewest active streams under the peer's
+`MAX_CONCURRENT_STREAMS`; unusable connections (GOAWAY, error) are dropped
+lazily. `Client::close()` (also run by the destructor) sends GOAWAY and shuts
+down every socket so peers observe EOF promptly.
+
+## What is deliberately absent
+
+HTTP/1.1 client fallback, HTTP/3, proxies, priority trees (parsed, ignored),
+server push (`ENABLE_PUSH=0`, PUSH_PROMISE is a connection error), trailers
+emission, DNS beyond a thread-pool `getaddrinfo`, and io_uring. Each has a
+seam: `Transport` for socket backends, `Resolver` for name resolution,
+`ErrorCode`/`FrameType` for protocol versions.

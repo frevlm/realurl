@@ -17,15 +17,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libcurl4-openssl-dev libboost-dev
+          sudo apt-get install -y ninja-build libboost-dev
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja curl boost
+        run: brew install ninja boost
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

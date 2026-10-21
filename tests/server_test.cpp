@@ -1,5 +1,5 @@
-#include "realurl/curl_multi_pool.hpp"
 #include "realurl/server.hpp"
+#include "support/http1_client.hpp"
 #include "test_harness.hpp"
 
 #include <arpa/inet.h>
@@ -248,52 +248,22 @@ void test_live_requests()
     for (int i = 0; i < 200 && !server.is_running(); ++i)
         std::this_thread::sleep_for(1ms);
 
-    realurl::CurlMultiPool pool;
-
-    realurl::CurlRequest get;
-    get.url = "http://127.0.0.1:" + std::to_string(port) + "/hello";
-    get.method = "GET";
-    get.content_length = 0;
-    const auto get_response = pool.execute(get);
-    CHECK(get_response.status_code == 200);
+    auto get_response = test::http1_request(port, "GET", "/hello");
+    CHECK(get_response.status == 200);
     CHECK(get_response.body == "world");
 
-    realurl::CurlRequest post;
-    post.url = "http://127.0.0.1:" + std::to_string(port) + "/echo";
-    post.method = "POST";
-    post.initial_body_chunk = "ping";
-    const auto post_response = pool.execute(post);
-    CHECK(post_response.status_code == 200);
+    auto post_response = test::http1_request(port, "POST", "/echo", "ping");
+    CHECK(post_response.status == 200);
     CHECK(post_response.body == "ping");
 
     const std::string large(256 * 1024, 'x');
-    realurl::CurlRequest upload;
-    upload.url = "http://127.0.0.1:" + std::to_string(port) + "/upload";
-    upload.method = "POST";
-    upload.initial_body_chunk = large;
-    const auto upload_response = pool.execute(upload);
-    CHECK(upload_response.status_code == 200);
+    auto upload_response = test::http1_request(port, "POST", "/upload", large);
+    CHECK(upload_response.status == 200);
     CHECK(upload_response.body == std::to_string(large.size()));
 
-    realurl::CurlRequest events;
-    events.url = "http://127.0.0.1:" + std::to_string(port) + "/events";
-    events.method = "GET";
-    events.content_length = 0;
-    auto stream = pool.execute_stream(events);
-    CHECK(stream.status_code == 200);
-    std::string body = stream.initial_body;
-    char buffer[256];
-    for (;;) {
-        const ssize_t n = stream.stream_read(buffer, sizeof(buffer), 1000);
-        if (n == 0)
-            break;
-        CHECK(n > 0);
-        if (n < 0)
-            break;
-        body.append(buffer, static_cast<size_t>(n));
-    }
-    stream.stream_close();
-    CHECK(body == "data: one\n\ndata: two\n\n");
+    auto events_response = test::http1_request(port, "GET", "/events");
+    CHECK(events_response.status == 200);
+    CHECK(events_response.body == "data: one\n\ndata: two\n\n");
 
     test_live_expect_continue(port);
 

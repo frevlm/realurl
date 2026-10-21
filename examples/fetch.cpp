@@ -1,9 +1,11 @@
-#include "realurl/curl_multi_pool.hpp"
+#include <realurl/http2.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <string>
-#include <string_view>
+
+using namespace std::chrono_literals;
 
 int main(int argc, char **argv)
 {
@@ -12,26 +14,25 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    realurl::EventLoop loop;
+    realurl::Client client(loop);
+    const std::string url = argv[1];
 
-    try {
-        realurl::CurlMultiPool pool;
-        realurl::CurlRequest request;
-        request.url = argv[1];
-        request.method = "GET";
-        request.content_length = 0;
+    int exit_code = 0;
+    auto run = [&]() -> realurl::Task<void> {
+        try {
+            const realurl::Response response = co_await client.get(url, 30s);
+            std::fprintf(stderr, "status: %d\n", response.head.status);
+            std::fwrite(response.body.data(), 1, response.body.size(), stdout);
+            std::fflush(stdout);
+        } catch (const std::exception &error) {
+            std::fprintf(stderr, "request failed: %s\n", error.what());
+            exit_code = 1;
+        }
+        loop.stop();
+    };
 
-        const realurl::CurlResponse response = pool.execute(request);
-        std::printf("status: %d\n", response.status_code);
-        for (const auto &header : response.headers)
-            std::printf("%s: %s\n", header.name.c_str(), header.value.c_str());
-        std::printf("\n%s", response.body.c_str());
-    } catch (const std::exception &err) {
-        std::fprintf(stderr, "request failed: %s\n", err.what());
-        curl_global_cleanup();
-        return 1;
-    }
-
-    curl_global_cleanup();
-    return 0;
+    loop.spawn(run());
+    loop.run();
+    return exit_code;
 }
