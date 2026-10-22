@@ -136,7 +136,12 @@ measured numbers. The short version:
   read/write interest once and awaiters park in the stream; steady-state
   traffic makes no `epoll_ctl`/`kevent` calls.
 - **Coroutine frames are pooled per thread.** `Task` frames come from a
-  size-class free list instead of malloc/free on every `co_await`.
+  size-class free list instead of malloc/free on every `co_await`. Hot-path
+  coroutines keep no large buffers across an await, so their frames stay in
+  the cached small classes.
+- **Two frames per unary response.** END_STREAM rides on the last DATA frame
+  (or on HEADERS for an empty body), and a drained socket is not re-polled
+  with a `recv` that would only return EAGAIN.
 - **Zero-copy read path when the caller keeps up.** DATA payload is memcpy'd
   straight into the suspended reader's buffer; a bounded 1 MiB receive buffer
   plus paused WINDOW_UPDATEs provide backpressure when it does not.

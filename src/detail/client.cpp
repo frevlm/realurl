@@ -16,8 +16,11 @@
 #include <coroutine>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
@@ -72,11 +75,9 @@ public:
 
     Task<std::shared_ptr<H2Connection>> connection(const UrlParts &url, std::chrono::milliseconds timeout)
     {
-        const std::string key = origin_key(url);
-
         OriginPool *pool = nullptr;
         for (;;) {
-            pool = &pool_for(key);
+            pool = &pool_for(url);
             auto &list = pool->conns;
             for (auto it = list.begin(); it != list.end();) {
                 if (!(*it)->usable())
@@ -155,19 +156,26 @@ private:
         bool wire_mode_known = false;
     };
 
-    static std::string origin_key(const UrlParts &url)
-    {
-        std::string key;
-        key.reserve(url.scheme.size() + url.host.size() + 16);
-        key.append(url.scheme).append("://").append(url.authority());
-        return key;
-    }
+    struct KeyHash {
+        using is_transparent = void;
 
-    OriginPool &pool_for(const std::string &key)
+        std::size_t operator()(std::string_view key) const noexcept
+        {
+            return std::hash<std::string_view>{}(key);
+        }
+    };
+
+    /// Origin pool for scheme://host:port. The key is built in a reused
+    /// buffer, so a lookup for a known origin does not allocate.
+    OriginPool &pool_for(const UrlParts &url)
     {
-        auto it = pools_.find(key);
+        key_scratch_.clear();
+        key_scratch_.append(url.scheme).append("://").append(url.host).push_back(':');
+        key_scratch_.append(std::to_string(url.port));
+
+        auto it = pools_.find(std::string_view(key_scratch_));
         if (it == pools_.end())
-            it = pools_.emplace(key, std::make_unique<OriginPool>()).first;
+            it = pools_.emplace(key_scratch_, std::make_unique<OriginPool>()).first;
         return *it->second;
     }
 
@@ -259,7 +267,8 @@ private:
     Config config_;
     Resolver resolver_;
     std::shared_ptr<TlsContext> tls_context_;
-    std::unordered_map<std::string, std::unique_ptr<OriginPool>> pools_;
+    std::unordered_map<std::string, std::unique_ptr<OriginPool>, KeyHash, std::equal_to<>> pools_;
+    std::string key_scratch_;
 };
 
 } // namespace detail
@@ -341,17 +350,10 @@ Task<Response> Client::request(std::string method, std::string url, Headers head
     }
 
     Response response;
-    response.head = co_await stream.head(timeout);
+    response.head = co_await stream.impl_->head(timeout);
     if (response.head.content_length.has_value() && *response.head.content_length <= 8 * 1024 * 1024)
         response.body.reserve(static_cast<std::size_t>(*response.head.content_length));
-
-    char buffer[16384];
-    for (;;) {
-        const std::size_t n = co_await stream.read({ buffer, sizeof(buffer) }, timeout);
-        if (n == 0)
-            break;
-        response.body.append(buffer, n);
-    }
+    co_await stream.impl_->read_all(response.body, timeout);
 
     co_return response;
 }

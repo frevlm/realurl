@@ -1,3 +1,6 @@
+#include "realurl/detail/frame.hpp"
+#include "realurl/detail/hpack.hpp"
+#include "realurl/detail/protocol.hpp"
 #include "realurl/http2.hpp"
 #include "realurl/server.hpp"
 
@@ -8,10 +11,13 @@
 #include <chrono>
 #include <cstdint>
 #include <netinet/in.h>
+#include <map>
 #include <string>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -94,6 +100,101 @@ int free_port()
     const int port = ntohs(address.sin_port);
     ::close(fd);
     return port;
+}
+
+struct WireFrame
+{
+    realurl::detail::h2::FrameType type;
+    std::uint8_t flags = 0;
+    std::string payload;
+};
+
+/// Speak raw h2c to the server and record the frames of each response, so
+/// the test sees exactly what goes on the wire.
+void test_unary_response_frames()
+{
+    namespace h2 = realurl::detail::h2;
+
+    const int port = free_port();
+    CHECK(port > 0);
+
+    realurl::Server server;
+    server.set_io_threads(1);
+    server.Get("/hello", [](const auto &, auto &response) { response.set_content("world"); });
+    server.Get("/empty", [](const auto &, auto &response) { response.status = 200; });
+
+    std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
+    for (int i = 0; i < 500 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(1ms);
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(static_cast<std::uint16_t>(port));
+    CHECK(::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0);
+    timeval timeout{ 5, 0 };
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    h2::HpackEncoder encoder;
+    h2::FrameWriter writer;
+    writer.settings({});
+    for (const auto &[id, path] : { std::pair<std::uint32_t, const char *>{ 1, "/hello" }, { 3, "/empty" } }) {
+        std::string block;
+        encoder.encode({ { ":method", "GET" }, { ":scheme", "http" }, { ":authority", "127.0.0.1" },
+                         { ":path", path } },
+                       block);
+        writer.headers(id, block, true, true);
+    }
+    std::string out(realurl::detail::kH2Preface);
+    out += writer.buffer();
+    CHECK(::send(fd, out.data(), out.size(), 0) == static_cast<ssize_t>(out.size()));
+
+    std::map<std::uint32_t, std::vector<WireFrame>> streams;
+    std::string input;
+    std::size_t ended = 0;
+    h2::FrameParser parser;
+    char buffer[4096];
+    while (ended < 2) {
+        const ssize_t n = ::recv(fd, buffer, sizeof(buffer), 0);
+        if (n <= 0)
+            break;
+        input.append(buffer, static_cast<std::size_t>(n));
+        std::size_t offset = 0;
+        h2::Frame frame;
+        while (parser.next(input, offset, frame) == h2::ParseResult::Ok) {
+            if (frame.header.stream_id == 0)
+                continue;
+            streams[frame.header.stream_id].push_back(
+                { frame.header.type, frame.header.flags, std::string(frame.payload) });
+            if ((frame.header.flags & h2::kFlagEndStream) != 0)
+                ++ended;
+        }
+        input.erase(0, offset);
+    }
+    ::close(fd);
+
+    // A body response is HEADERS + one DATA frame that also carries END_STREAM.
+    const std::vector<WireFrame> &hello = streams[1];
+    CHECK(hello.size() == 2);
+    if (hello.size() == 2) {
+        CHECK(hello[0].type == h2::FrameType::Headers);
+        CHECK(hello[0].flags == h2::kFlagEndHeaders);
+        CHECK(hello[1].type == h2::FrameType::Data);
+        CHECK(hello[1].flags == h2::kFlagEndStream);
+        CHECK(hello[1].payload == "world");
+    }
+
+    // An empty body ends the stream on HEADERS.
+    const std::vector<WireFrame> &empty = streams[3];
+    CHECK(empty.size() == 1);
+    if (empty.size() == 1) {
+        CHECK(empty[0].type == h2::FrameType::Headers);
+        CHECK(empty[0].flags == (h2::kFlagEndHeaders | h2::kFlagEndStream));
+    }
+
+    server.stop();
+    listener.join();
 }
 
 void test_unary_and_streaming()
@@ -202,6 +303,7 @@ void test_concurrent_streams()
 int main()
 {
     test_unary_and_streaming();
+    test_unary_response_frames();
     test_concurrent_streams();
     return test::summary();
 }

@@ -7,6 +7,91 @@ the clocks, so percentiles reflect steady state. RSS/CPU include the in-tree
 test server that runs in the same process. The tables below the architecture
 pass are the original 0.3 baseline.
 
+## Two-end hot path (0.5.x)
+
+Measured on Apple M5 / macOS, loopback, Release build. `base` is commit
+`0a4cffa` (the native transport release, the code behind the 0.5 tables
+below); `new` is the hot-path pass described here. The two binaries ran
+interleaved, five rounds per row, and the table reports the median of each
+column. The host had a background process holding 90-260% CPU during these
+runs, so absolute numbers sit below the 0.5 tables; compare rows against each
+other, not across sections.
+
+### Unary: 200,000 requests, 1,000 streams, 1 connection
+
+| Protocol | Build | req/s | p50 | p99 | CPU/req | Peak RSS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| h2 | base | 528,888 | 1.582 ms | 4.310 ms | 2.0 µs | 87.0 MB |
+| h2 | new | 914,461 | 1.012 ms | 1.700 ms | 1.7 µs | 16.7 MB |
+| native | base | 721,061 | 1.166 ms | 2.940 ms | 1.5 µs | 86.5 MB |
+| native | new | **2,026,461** | **0.419 ms** | **1.198 ms** | **0.7 µs** | **16.3 MB** |
+
+Native: **2.8x throughput, -64% p50, -59% p99, -53% CPU/req, -81% peak RSS**.
+h2 shares the stream engine and gains 1.7x.
+
+### Single stream: 40,000 requests, concurrency 1
+
+| Protocol | Build | req/s | p50 | p99 | CPU/req |
+| --- | --- | ---: | ---: | ---: | ---: |
+| h2 | base | 48,826 | 0.017 ms | 0.075 ms | 16.3 µs |
+| h2 | new | 52,229 | 0.015 ms | 0.067 ms | 14.8 µs |
+| native | base | 52,775 | 0.016 ms | 0.068 ms | 14.9 µs |
+| native | new | 56,520 | 0.015 ms | 0.062 ms | 13.1 µs |
+
+Native: +7% throughput, -12% CPU/req. This path is bound by the socket round
+trip; the gain is the dropped EAGAIN `recv` on each side.
+
+### 2 MiB upload + 20 s SSE: 100 concurrency, 1 connection
+
+Three interleaved native runs per build:
+
+| Build | TTFT p50 | CPU/req | Peak RSS |
+| --- | ---: | ---: | ---: |
+| base | 141.7 / 158.2 / 153.0 ms | 1.94 / 1.82 / 2.21 ms | 568 / 539 / 567 MB |
+| new | 146.8 / 132.9 / 144.0 ms | 2.16 / 2.08 / 2.01 ms | 555 / 573 / 556 MB |
+
+Parity within noise. Wall time (19.15 s) is set by the 20 s stream; the
+upload and long-lived streams do not exercise the per-request costs removed
+here. The flat stream buffer does not raise peak RSS.
+
+### Where the time went
+
+Profiles (`sample`, 1,000-way native unary) of `base` showed the client and
+server loops idle 35-50% of the time: the two ends alternate, so per-request
+CPU on either side sets throughput. Header coding was minor. The costs were:
+
+1. **16 KiB buffers inside coroutine frames.** `Client::request` and the
+   server's `run_handler` each kept `char buffer[16384]` across a `co_await`,
+   so the buffer lived in the frame and pushed it into the 32 KiB pool class.
+   That class caches 256 frames per thread; at 1,000 in flight every request
+   paid a 32 KiB malloc/free. Bodies now drain straight from the stream queue
+   into `Response::body` / `Request::body`, and a request with no body never
+   enters the read path. This is also the RSS drop.
+2. **Per-stream `std::deque<std::string>` queues.** The first push on each
+   stream allocated a ~4 KiB deque block and freed it at stream close: ~19% of
+   server CPU and ~14% of client CPU. Both ends now use `ByteQueue`, one
+   contiguous buffer with amortized compaction.
+3. **A separate END_STREAM frame.** A unary response was HEADERS + DATA +
+   empty DATA(END_STREAM). END_STREAM now rides on the frame carrying the last
+   byte, and an empty body ends on HEADERS. Request bodies get the same.
+4. **EAGAIN `recv` after every read.** `TcpStream` now remembers that a short
+   read drained the socket and parks until the next read edge.
+5. **Small per-request allocations:** HEADERS built in a temporary
+   `FrameWriter`, the response head encoded into a per-stream string, a header
+   view vector per response on both ends, and an origin key that exceeded the
+   short-string buffer on every request. All of them now reuse
+   connection-owned buffers.
+
+### Reproduce
+
+```sh
+./build/bench/realurl_bench h2_unary 200000 1000 1 h2
+./build/bench/realurl_bench h2_unary 200000 1000 1 native
+./build/bench/realurl_bench h2_unary 40000 1 1 h2
+./build/bench/realurl_bench h2_unary 40000 1 1 native
+./build/bench/realurl_bench native_llm 100 100 20 1 1 native
+```
+
 ## Native transport A/B (realurl/1, 0.5)
 
 Measured on Apple M5 / macOS, loopback, Release build, OpenSSL 3.6.5. Both
@@ -419,7 +504,7 @@ Streaming mode (100 concurrency, tokens streamed in 20 chunks over 20 s):
 
 Reading:
 - **Fair Round-Robin Data Interleaving**: Multi-stream sending uses deficit/round-robin interleaving where each active stream sends up to 1 DATA frame per cycle, preventing the first stream from monopolizing the connection send window and reducing TTFT variance to near zero.
-- **Zero-Memmove Buffer Queue**: Send and receive paths use chunked queues (`std::deque<std::string>`) with cursor offsets instead of `std::string::erase(0, offset)`, eliminating dozens of megabytes of `std::memmove` per request.
+- **Amortized Buffer Queue**: Send and receive paths use `ByteQueue`, one contiguous buffer with a read cursor. The consumed prefix is reclaimed when the queue drains, or compacted once it is at least as large as the live bytes, so no `std::string::erase(0, offset)` runs per read. (0.3 used chunked `std::deque<std::string>` queues; the per-stream deque block allocation they cost is gone, see "Two-end hot path".)
 - **Zero failure rate up to 1,000 concurrent 2 MB streams**: Unlike the legacy 0.2 libcurl stack which hit `FD_SETSIZE` and collapsed (759/1,000 with 241 HTTP 502 errors under 20 s streams), realurl maintains 100% success rate at 2,741.7 RPM (1,000 concurrent 20 s streams).
 - **Linear memory scaling**: In-flight RSS scales directly with the active payloads. At 1,000 concurrency, 2 GB of payload data was concurrently uploaded with a peak RSS of only ~1.2 GB, thanks to dynamic buffer compaction and flow control backpressure.
 - **Low CPU footprint**: CPU per request stays flat at ~11–12 ms despite transferring 2 MB of data per request, with total CPU during the 20-second window consuming only ~11 seconds across 1,000 requests (~5% of overall capacity).
@@ -439,8 +524,14 @@ libcurl.
 - Write path: active `write_queue_` containing only streams with pending writes,
   eliminating O(N) stream scans across idle streams waiting for server responses.
 - Batching: double-buffered `out_buffer_` swap flushes up to 512 KB per cycle in a single socket write.
-- Inline frame serialization: direct stack-buffer formatting for DATA, RST, and WINDOW_UPDATE
-  frames without `FrameWriter` heap allocations.
+- Inline frame serialization: `append_frame_header` / `append_headers` write
+  DATA, HEADERS and CONTINUATION frames straight into the connection's
+  outbound buffer, without `FrameWriter` heap allocations.
+- END_STREAM rides on the DATA frame that carries the last queued byte; an
+  empty body ends on HEADERS. A unary response is two frames.
+- No large buffers in hot-path coroutine frames: buffered bodies drain from the
+  stream queue into the destination string, keeping frames in the pooled small
+  size classes.
 - Flow control: fair deficit/round-robin interleaving among active streams in `write_queue_`,
   with automatic suspension to `blocked_streams_` on window exhaustion and re-enqueue on WINDOW_UPDATE.
 - Connection pooling: least-loaded connection selection using `max_conns_per_origin` and

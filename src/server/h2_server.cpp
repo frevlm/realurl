@@ -1,5 +1,6 @@
 #include "h2_server.hpp"
 
+#include "realurl/detail/byte_queue.hpp"
 #include "realurl/detail/native_codec.hpp"
 #include "realurl/detail/protocol.hpp"
 
@@ -207,7 +208,7 @@ public:
 
     bool has_pending_work() const noexcept
     {
-        return send_pending_ > 0 || (end_pending_ && !end_sent_);
+        return !send_queue_.empty() || (end_pending_ && !end_sent_);
     }
 
     void on_headers(h2::HeaderList &&headers, bool end_stream);
@@ -269,7 +270,7 @@ private:
     void check_closed();
     std::size_t send_pending() const noexcept
     {
-        return send_pending_;
+        return send_queue_.size();
     }
 
     H2ServerConnection *connection_;
@@ -281,7 +282,6 @@ private:
     std::string decoded_path_storage_;
     std::string native_head_storage_;
     std::string content_length_storage_;
-    std::string head_block_;
     h2::HeaderList headers_;
     std::vector<Header> request_header_views_;
     Request request_;
@@ -296,15 +296,11 @@ private:
     bool head_only_ = false;
     int error_ = 0;
 
-    std::deque<std::string> recv_queue_;
-    std::size_t recv_chunk_offset_ = 0;
-    std::size_t recv_pending_ = 0;
+    ByteQueue recv_queue_;
     std::uint32_t recv_unacked_ = 0;
     std::int64_t recv_window_ = kStreamRecvWindow;
 
-    std::deque<std::string> send_queue_;
-    std::size_t send_chunk_offset_ = 0;
-    std::size_t send_pending_ = 0;
+    ByteQueue send_queue_;
     std::int64_t send_window_ = h2::kDefaultInitialWindowSize;
 
     ReadAwaiter *read_waiter_ = nullptr;
@@ -882,26 +878,14 @@ void H2ServerConnection::send_goaway(h2::ErrorCode code)
     schedule_flush();
 }
 
-void H2ServerConnection::queue_headers(std::uint32_t stream_id, std::string_view block, bool end_stream)
+bool H2ServerConnection::send_response_head(std::uint32_t stream_id, int status, std::span<const Header> headers,
+                                            std::optional<std::uint64_t> content_length, bool end_stream)
 {
-    h2::FrameWriter writer;
-    if (block.size() <= max_frame_size_) {
-        writer.headers(stream_id, block, true, end_stream);
-        write_buffer_.append(writer.buffer());
-    } else {
-        writer.headers(stream_id, block.substr(0, max_frame_size_), false, end_stream);
-        write_buffer_.append(writer.buffer());
-        std::size_t offset = max_frame_size_;
-        while (offset < block.size()) {
-            const std::size_t n = std::min<std::size_t>(max_frame_size_, block.size() - offset);
-            const bool last = offset + n == block.size();
-            h2::FrameWriter continuation;
-            continuation.continuation(stream_id, block.substr(offset, n), last);
-            write_buffer_.append(continuation.buffer());
-            offset += n;
-        }
-    }
+    if (!encode_response_head(status, headers, content_length, head_scratch_))
+        return false;
+    h2::append_headers(write_buffer_, stream_id, head_scratch_, end_stream, max_frame_size_);
     schedule_flush();
+    return true;
 }
 
 bool H2ServerConnection::encode_response_head(int status, std::span<const Header> headers,
@@ -927,20 +911,9 @@ bool H2ServerConnection::encode_response_head(int status, std::span<const Header
 
 void H2ServerConnection::append_data(std::uint32_t stream_id, std::string_view data, bool end_stream)
 {
-    char header[9];
-    const std::size_t length = data.size();
-    header[0] = static_cast<char>((length >> 16) & 0xff);
-    header[1] = static_cast<char>((length >> 8) & 0xff);
-    header[2] = static_cast<char>(length & 0xff);
-    header[3] = static_cast<char>(h2::FrameType::Data);
-    header[4] = static_cast<char>(end_stream ? h2::kFlagEndStream : 0);
-    header[5] = static_cast<char>((stream_id >> 24) & 0x7f);
-    header[6] = static_cast<char>((stream_id >> 16) & 0xff);
-    header[7] = static_cast<char>((stream_id >> 8) & 0xff);
-    header[8] = static_cast<char>(stream_id & 0xff);
-    write_buffer_.append(header, sizeof(header));
-    if (!data.empty())
-        write_buffer_.append(data);
+    h2::append_frame_header(write_buffer_, h2::FrameType::Data, end_stream ? h2::kFlagEndStream : 0,
+                            stream_id, data.size());
+    write_buffer_.append(data);
 }
 
 void H2ServerConnection::send_rst(std::uint32_t stream_id, h2::ErrorCode code)
@@ -1116,7 +1089,7 @@ void H2ServerStream::on_headers(h2::HeaderList &&headers, bool end_stream)
     if (head_ready_) {
         remote_closed_ = remote_closed_ || end_stream;
         if (end_stream) {
-            if (read_waiter_ != nullptr && recv_pending_ == 0)
+            if (read_waiter_ != nullptr && recv_queue_.empty())
                 complete_read(read_waiter_);
         }
         check_closed();
@@ -1157,7 +1130,7 @@ void H2ServerStream::on_native_headers(std::string block, bool end_stream)
 
         remote_closed_ = remote_closed_ || end_stream;
         if (end_stream) {
-            if (read_waiter_ != nullptr && recv_pending_ == 0)
+            if (read_waiter_ != nullptr && recv_queue_.empty())
                 complete_read(read_waiter_);
         }
         check_closed();
@@ -1218,21 +1191,17 @@ void H2ServerStream::on_data(std::string_view data, bool end_stream, std::uint32
         if (n > 0)
             std::memcpy(waiter->buffer_.data(), data.data(), n);
         waiter->n_ = n;
-        if (n < data.size()) {
-            recv_queue_.push_back(std::string(data.substr(n)));
-            recv_pending_ += data.size() - n;
-        }
+        recv_queue_.append(data.substr(n));
         complete_read(waiter);
     } else {
-        recv_queue_.push_back(std::string(data));
-        recv_pending_ += data.size();
+        recv_queue_.append(data);
     }
 
     if (end_stream)
         remote_closed_ = true;
 
     flush_window();
-    if (end_stream && read_waiter_ != nullptr && recv_pending_ == 0)
+    if (end_stream && read_waiter_ != nullptr && recv_queue_.empty())
         complete_read(read_waiter_);
     check_closed();
 }
@@ -1338,23 +1307,10 @@ Task<std::size_t> H2ServerStream::read(std::span<char> buffer)
     if (buffer.empty())
         throw std::invalid_argument("h2 server read: empty buffer");
 
-    if (recv_pending_ > 0) {
-        std::size_t copied = 0;
-        while (!recv_queue_.empty() && copied < buffer.size()) {
-            auto &front = recv_queue_.front();
-            const std::size_t available = front.size() - recv_chunk_offset_;
-            const std::size_t n = std::min(available, buffer.size() - copied);
-            std::memcpy(buffer.data() + copied, front.data() + recv_chunk_offset_, n);
-            copied += n;
-            recv_chunk_offset_ += n;
-            recv_pending_ -= n;
-            if (recv_chunk_offset_ == front.size()) {
-                recv_queue_.pop_front();
-                recv_chunk_offset_ = 0;
-            }
-        }
+    if (!recv_queue_.empty()) {
+        const std::size_t n = recv_queue_.read(buffer);
         flush_window();
-        co_return copied;
+        co_return n;
     }
 
     if (error_ != 0)
@@ -1371,14 +1327,12 @@ Task<void> H2ServerStream::write_head(int status, std::span<const Header> header
     if (head_sent_ || closed_)
         co_return;
 
-    if (!connection_->encode_response_head(status, headers, content_length, head_block_)) {
+    const bool no_body = head_only_ || !status_allows_body(status) ||
+                         (content_length.has_value() && *content_length == 0);
+    if (!connection_->send_response_head(id_, status, headers, content_length, no_body)) {
         cancel();
         co_return;
     }
-
-    const bool no_body = head_only_ || !status_allows_body(status) ||
-                         (content_length.has_value() && *content_length == 0);
-    connection_->queue_headers(id_, head_block_, no_body);
     head_sent_ = true;
     if (no_body) {
         end_sent_ = true;
@@ -1397,11 +1351,10 @@ Task<bool> H2ServerStream::write(std::string_view data)
     if (data.empty())
         co_return true;
 
-    send_queue_.push_back(std::string(data));
-    send_pending_ += data.size();
+    send_queue_.append(data);
     connection_->enqueue_write(id_);
 
-    if (send_pending_ >= kSendHighWater)
+    if (send_queue_.size() >= kSendHighWater)
         co_await WriteAwaiter(*this);
     co_return !closed_;
 }
@@ -1442,20 +1395,18 @@ Task<void> H2ServerStream::send_fixed_response(const Response &response)
     const std::optional<std::uint64_t> content_length =
         body_allowed ? std::optional<std::uint64_t>(response.body_size()) : std::nullopt;
 
-    std::vector<Header> views;
-    views.reserve(response.headers.size() + 1);
+    std::vector<Header> &views = connection_->header_scratch_;
+    views.clear();
     for (const auto &header : response.headers)
         views.emplace_back(header.first, header.second);
     if (!response.content_type.empty())
         views.emplace_back("content-type", response.content_type);
 
-    if (!connection_->encode_response_head(response.status, views, content_length, head_block_)) {
+    const bool no_body = head_only_ || !body_allowed || response.body_size() == 0;
+    if (!connection_->send_response_head(id_, response.status, views, content_length, no_body)) {
         cancel();
         co_return;
     }
-
-    const bool no_body = head_only_ || !body_allowed;
-    connection_->queue_headers(id_, head_block_, no_body);
     head_sent_ = true;
 
     if (no_body) {
@@ -1465,14 +1416,7 @@ Task<void> H2ServerStream::send_fixed_response(const Response &response)
         co_return;
     }
 
-    const std::uint64_t size = response.body_size();
-    if (size > 0) {
-        if (!response.body_view.empty())
-            send_queue_.push_back(std::string(response.body_view));
-        else
-            send_queue_.push_back(response.body);
-        send_pending_ = send_queue_.front().size();
-    }
+    send_queue_.append(response.body_view.empty() ? std::string_view(response.body) : response.body_view);
     end_pending_ = true;
     connection_->enqueue_write(id_);
     if (end_sent_)
@@ -1513,17 +1457,23 @@ Task<void> H2ServerStream::run_handler()
     }
 
     if (request_.body_mode == BodyMode::Buffered) {
-        char buffer[16384];
+        const std::size_t payload_max = connection_->context().payload_max;
         for (;;) {
-            const std::size_t n = co_await read({ buffer, sizeof(buffer) });
-            if (n == 0)
-                break;
-            if (connection_->context().payload_max != 0 &&
-                request_.body.size() + n > connection_->context().payload_max) {
+            if (payload_max != 0 && request_.body.size() + recv_queue_.size() > payload_max) {
                 co_await send_error(413);
                 co_return;
             }
-            request_.body.append(buffer, n);
+            if (!recv_queue_.empty()) {
+                recv_queue_.drain_to(request_.body);
+                flush_window();
+            }
+            if (error_ != 0)
+                throw std::system_error(error_, std::generic_category(), "h2 server read");
+            if (remote_closed_ || closed_)
+                break;
+            // An empty buffer parks until data, END_STREAM or an error arrives;
+            // on_data queues the bytes for the next drain.
+            co_await ReadAwaiter(*this, {});
         }
         request_.content_length = static_cast<long long>(request_.body.size());
     } else {
@@ -1579,47 +1529,37 @@ H2PumpResult H2ServerStream::pump_one_frame()
     if (closed_)
         return H2PumpResult::NoWork;
 
-    if (send_pending_ > 0) {
+    if (send_queue_.empty() && !end_pending_)
+        return H2PumpResult::NoWork;
+
+    std::string_view chunk;
+    if (!send_queue_.empty()) {
         const std::int64_t window = std::min<std::int64_t>(connection_->send_window(), send_window_);
         if (window <= 0)
             return H2PumpResult::WindowFull;
-
-        const std::size_t allowed = std::min<std::size_t>(
-            { send_pending_, static_cast<std::size_t>(window), connection_->max_frame_size() });
-
-        auto &front = send_queue_.front();
-        const std::size_t available = front.size() - send_chunk_offset_;
-        const std::size_t to_send = std::min(allowed, available);
-
-        connection_->append_data(id_, std::string_view(front).substr(send_chunk_offset_, to_send), false);
-        send_chunk_offset_ += to_send;
-        send_pending_ -= to_send;
-        connection_->consume_send_window(to_send);
-        send_window_ -= static_cast<std::int64_t>(to_send);
-
-        if (send_chunk_offset_ == front.size()) {
-            send_queue_.pop_front();
-            send_chunk_offset_ = 0;
-        }
-
-        if (send_pending_ <= kSendLowWater && write_waiter_ != nullptr)
-            complete_write(write_waiter_);
-
-        return H2PumpResult::SentFrame;
+        chunk = send_queue_.front(std::min<std::size_t>(static_cast<std::size_t>(window),
+                                                        connection_->max_frame_size()));
     }
 
-    if (send_pending_ == 0 && end_pending_ && !end_sent_) {
-        connection_->append_data(id_, {}, true);
+    // END_STREAM rides on the frame that carries the last queued byte.
+    const bool end_stream = end_pending_ && chunk.size() == send_queue_.size();
+    connection_->append_data(id_, chunk, end_stream);
+    connection_->consume_send_window(chunk.size());
+    send_window_ -= static_cast<std::int64_t>(chunk.size());
+    send_queue_.consume(chunk.size());
+
+    if (send_queue_.size() <= kSendLowWater && write_waiter_ != nullptr)
+        complete_write(write_waiter_);
+
+    if (end_stream) {
         end_pending_ = false;
         end_sent_ = true;
         local_closed_ = true;
         if (end_waiter_ != nullptr)
             complete_end(end_waiter_);
-        check_closed();
-        return H2PumpResult::SentFrame;
     }
-
-    return H2PumpResult::NoWork;
+    check_closed();
+    return H2PumpResult::SentFrame;
 }
 
 bool H2ServerStream::pump()
@@ -1634,7 +1574,7 @@ void H2ServerStream::flush_window()
 {
     if (closed_)
         return;
-    if (recv_pending_ >= kRecvHighWater)
+    if (recv_queue_.size() >= kRecvHighWater)
         return;
     if (recv_unacked_ >= kWindowUpdateThreshold) {
         connection_->send_window_update(id_, recv_unacked_);
@@ -1666,11 +1606,7 @@ void H2ServerStream::fail(int error)
     }
 
     send_queue_.clear();
-    send_pending_ = 0;
-    send_chunk_offset_ = 0;
     recv_queue_.clear();
-    recv_pending_ = 0;
-    recv_chunk_offset_ = 0;
 
     if (connection_ != nullptr) {
         connection_->on_stream_closed(id_);
@@ -1687,7 +1623,7 @@ void H2ServerStream::check_closed()
         connection_->on_stream_closed(id_);
         connection_ = nullptr;
     }
-    if (read_waiter_ != nullptr && recv_pending_ == 0)
+    if (read_waiter_ != nullptr && recv_queue_.empty())
         complete_read(read_waiter_);
 }
 

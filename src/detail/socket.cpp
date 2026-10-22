@@ -314,6 +314,8 @@ void TcpStream::on_io(void *ctx, std::uint32_t events)
 
 void TcpStream::handle_io(std::uint32_t events)
 {
+    if ((events & (kIoRead | kIoError)) != 0)
+        readable_ = true;
     if (read_waiter_ != nullptr && (events & (kIoRead | kIoError)) != 0)
         read_waiter_->complete(events, 0);
     if (write_waiter_ != nullptr && (events & (kIoWrite | kIoError)) != 0)
@@ -368,16 +370,22 @@ int TcpStream::release() noexcept
 Task<std::size_t> TcpStream::read(std::span<char> buffer, std::chrono::milliseconds idle)
 {
     for (;;) {
+        if (!readable_)
+            (void)co_await IoWaiter(*loop_, *this, kIoRead, idle);
         const ssize_t n = ::recv(fd_, buffer.data(), buffer.size(), 0);
-        if (n > 0)
+        if (n > 0) {
+            // A stream recv returns everything queued up to the buffer size,
+            // so a short read means the socket is drained.
+            readable_ = static_cast<std::size_t>(n) == buffer.size();
             co_return static_cast<std::size_t>(n);
+        }
         if (n == 0)
             co_return 0;
         if (errno == EINTR)
             continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             throw_errno("recv");
-        (void)co_await IoWaiter(*loop_, *this, kIoRead, idle);
+        readable_ = false;
     }
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "realurl/detail/byte_queue.hpp"
 #include "realurl/detail/event_loop.hpp"
 #include "realurl/detail/frame.hpp"
 #include "realurl/detail/hpack.hpp"
@@ -105,6 +106,8 @@ public:
 
     Task<ResponseHead> head(std::chrono::milliseconds timeout);
     Task<std::size_t> read(std::span<char> buffer, std::chrono::milliseconds idle);
+    /// Append the rest of the body to `out` until END_STREAM.
+    Task<void> read_all(std::string &out, std::chrono::milliseconds idle);
     Task<void> write(std::string_view data, std::chrono::milliseconds timeout);
     Task<void> end(std::chrono::milliseconds timeout);
     void cancel();
@@ -123,7 +126,7 @@ public:
     }
     bool has_pending_work() const noexcept
     {
-        return send_pending_ > 0 || (end_pending_ && !end_sent_);
+        return !send_queue_.empty() || (end_pending_ && !end_sent_);
     }
 
 private:
@@ -152,7 +155,7 @@ private:
     void flush_window();
     std::size_t send_pending() const noexcept
     {
-        return send_pending_;
+        return send_queue_.size();
     }
 
     static constexpr std::size_t kSendHighWater = 256 * 1024;
@@ -176,14 +179,10 @@ private:
 
     ResponseHead head_result_;
 
-    std::deque<std::string> recv_queue_;
-    std::size_t recv_chunk_offset_ = 0;
-    std::size_t recv_pending_ = 0;
+    ByteQueue recv_queue_;
     std::size_t recv_unacked_ = 0;
 
-    std::deque<std::string> send_queue_;
-    std::size_t send_chunk_offset_ = 0;
-    std::size_t send_pending_ = 0;
+    ByteQueue send_queue_;
     std::int64_t send_window_ = kDefaultInitialWindowSize;
 
     HeadAwaiter *head_waiter_ = nullptr;
@@ -282,6 +281,7 @@ private:
     HpackEncoder encoder_;
 
     std::string native_head_scratch_;
+    std::vector<std::pair<std::string_view, std::string_view>> native_views_;
     std::string read_buffer_;
     std::string write_buffer_;
     std::string out_buffer_;

@@ -434,23 +434,10 @@ Task<std::size_t> H2StreamImpl::read(std::span<char> buffer, std::chrono::millis
     if (buffer.empty())
         throw std::invalid_argument("h2 read: empty buffer");
 
-    if (recv_pending_ > 0) {
-        std::size_t total_copied = 0;
-        while (!recv_queue_.empty() && total_copied < buffer.size()) {
-            auto &front = recv_queue_.front();
-            const std::size_t available = front.size() - recv_chunk_offset_;
-            const std::size_t n = std::min(available, buffer.size() - total_copied);
-            std::memcpy(buffer.data() + total_copied, front.data() + recv_chunk_offset_, n);
-            total_copied += n;
-            recv_chunk_offset_ += n;
-            recv_pending_ -= n;
-            if (recv_chunk_offset_ == front.size()) {
-                recv_queue_.pop_front();
-                recv_chunk_offset_ = 0;
-            }
-        }
+    if (!recv_queue_.empty()) {
+        const std::size_t n = recv_queue_.read(buffer);
         flush_window();
-        co_return total_copied;
+        co_return n;
     }
 
     if (error_ != 0)
@@ -461,13 +448,30 @@ Task<std::size_t> H2StreamImpl::read(std::span<char> buffer, std::chrono::millis
     co_return co_await ReadAwaiter(*this, buffer, idle);
 }
 
+Task<void> H2StreamImpl::read_all(std::string &out, std::chrono::milliseconds idle)
+{
+    for (;;) {
+        if (!recv_queue_.empty()) {
+            recv_queue_.drain_to(out);
+            flush_window();
+        }
+        if (error_ != 0)
+            throw std::system_error(error_, std::generic_category(), "h2 read");
+        if (remote_closed_ || closed_)
+            co_return;
+        // An empty buffer parks until data, END_STREAM or an error arrives;
+        // on_data queues the bytes for the next drain.
+        co_await ReadAwaiter(*this, {}, idle);
+    }
+}
+
 Task<void> H2StreamImpl::write(std::string_view data, std::chrono::milliseconds timeout)
 {
     if (closed_ || local_closed_)
         throw std::system_error(EPIPE, std::generic_category(), "h2 write");
 
     while (!data.empty()) {
-        const std::size_t pending = send_pending_;
+        const std::size_t pending = send_queue_.size();
         const std::size_t space = pending < kSendHighWater ? kSendHighWater - pending : 0;
         if (space == 0) {
             if (connection_ != nullptr && !in_write_queue_ && !blocked_on_window_) {
@@ -480,16 +484,8 @@ Task<void> H2StreamImpl::write(std::string_view data, std::chrono::milliseconds 
         }
 
         const std::size_t n = std::min(space, data.size());
-        if (!send_queue_.empty() && send_queue_.back().size() < 16384) {
-            const std::size_t append_n = std::min(16384 - send_queue_.back().size(), n);
-            send_queue_.back().append(data.substr(0, append_n));
-            send_pending_ += append_n;
-            data.remove_prefix(append_n);
-        } else {
-            send_queue_.push_back(std::string(data.substr(0, n)));
-            send_pending_ += n;
-            data.remove_prefix(n);
-        }
+        send_queue_.append(data.substr(0, n));
+        data.remove_prefix(n);
 
         if (connection_ != nullptr && !in_write_queue_ && !blocked_on_window_) {
             connection_->enqueue_write(id_);
@@ -552,7 +548,7 @@ void H2StreamImpl::on_head(ResponseHead &&head, bool end_stream)
 
     if (end_stream || head_result_.status == 204 || head_result_.status == 304) {
         remote_closed_ = true;
-        if (read_waiter_ != nullptr && recv_pending_ == 0) {
+        if (read_waiter_ != nullptr && recv_queue_.empty()) {
             if (read_waiter_->n_ == 0)
                 complete_read(read_waiter_);
         }
@@ -573,14 +569,10 @@ void H2StreamImpl::on_data(std::string_view data, bool end_stream, std::uint32_t
         if (n > 0)
             std::memcpy(waiter->buffer_.data(), data.data(), n);
         waiter->n_ = n;
-        if (n < data.size()) {
-            recv_queue_.push_back(std::string(data.substr(n)));
-            recv_pending_ += (data.size() - n);
-        }
+        recv_queue_.append(data.substr(n));
         complete_read(waiter);
     } else {
-        recv_queue_.push_back(std::string(data));
-        recv_pending_ += data.size();
+        recv_queue_.append(data);
     }
 
     if (end_stream)
@@ -635,7 +627,7 @@ void H2StreamImpl::flush_window()
 {
     if (connection_ == nullptr || closed_)
         return;
-    if (recv_pending_ >= kRecvHighWater)
+    if (recv_queue_.size() >= kRecvHighWater)
         return;
     if (recv_unacked_ >= kWindowUpdateThreshold) {
         connection_->send_window_update(id_, recv_unacked_);
@@ -648,49 +640,37 @@ PumpResult H2StreamImpl::pump_one_frame()
     if (connection_ == nullptr || closed_)
         return PumpResult::NoWork;
 
-    if (send_pending_ > 0) {
+    if (send_queue_.empty() && !end_pending_)
+        return PumpResult::NoWork;
+
+    std::string_view chunk;
+    if (!send_queue_.empty()) {
         const std::int64_t window = std::min<std::int64_t>(connection_->send_window(), send_window_);
         if (window <= 0)
             return PumpResult::WindowFull;
-
-        const std::size_t max_frame = connection_->max_frame_size();
-        const std::size_t allowed =
-            std::min<std::size_t>({ send_pending_, static_cast<std::size_t>(window), max_frame });
-
-        auto &front = send_queue_.front();
-        const std::size_t avail = front.size() - send_chunk_offset_;
-        const std::size_t to_send = std::min(allowed, avail);
-
-        connection_->append_data(id_, std::string_view(front).substr(send_chunk_offset_, to_send), false);
-        send_chunk_offset_ += to_send;
-        send_pending_ -= to_send;
-        connection_->consume_send_window(to_send);
-        send_window_ -= static_cast<std::int64_t>(to_send);
-
-        if (send_chunk_offset_ == front.size()) {
-            send_queue_.pop_front();
-            send_chunk_offset_ = 0;
-        }
-
-        if (send_pending_ <= kSendLowWater && write_waiter_ != nullptr)
-            complete_write(write_waiter_);
-
-        check_closed();
-        return PumpResult::SentFrame;
+        chunk = send_queue_.front(std::min<std::size_t>(static_cast<std::size_t>(window),
+                                                        connection_->max_frame_size()));
     }
 
-    if (send_pending_ == 0 && end_pending_ && !end_sent_) {
-        connection_->append_data(id_, {}, true);
+    // END_STREAM rides on the frame that carries the last queued byte.
+    const bool end_stream = end_pending_ && chunk.size() == send_queue_.size();
+    connection_->append_data(id_, chunk, end_stream);
+    connection_->consume_send_window(chunk.size());
+    send_window_ -= static_cast<std::int64_t>(chunk.size());
+    send_queue_.consume(chunk.size());
+
+    if (send_queue_.size() <= kSendLowWater && write_waiter_ != nullptr)
+        complete_write(write_waiter_);
+
+    if (end_stream) {
         end_pending_ = false;
         end_sent_ = true;
         local_closed_ = true;
         if (end_waiter_ != nullptr)
             complete_end(end_waiter_);
-        check_closed();
-        return PumpResult::SentFrame;
     }
-
-    return PumpResult::NoWork;
+    check_closed();
+    return PumpResult::SentFrame;
 }
 
 bool H2StreamImpl::pump()
@@ -729,11 +709,7 @@ void H2StreamImpl::fail(int error)
     }
 
     send_queue_.clear();
-    send_pending_ = 0;
-    send_chunk_offset_ = 0;
     recv_queue_.clear();
-    recv_pending_ = 0;
-    recv_chunk_offset_ = 0;
 
     if (connection_ != nullptr) {
         connection_->on_stream_closed(id_);
@@ -751,7 +727,7 @@ void H2StreamImpl::check_closed()
         connection_->on_stream_closed(id_);
         connection_ = nullptr;
     }
-    if (read_waiter_ != nullptr && recv_pending_ == 0)
+    if (read_waiter_ != nullptr && recv_queue_.empty())
         complete_read(read_waiter_);
 }
 
@@ -884,44 +860,14 @@ std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::s
 
 void H2Connection::send_headers(std::uint32_t stream_id, std::string_view block, bool end_stream)
 {
-    FrameWriter writer;
-    if (block.size() <= max_frame_size_) {
-        writer.headers(stream_id, block, true, end_stream);
-        write_buffer_.append(writer.buffer());
-    } else {
-        writer.headers(stream_id, block.substr(0, max_frame_size_), false, end_stream);
-        write_buffer_.append(writer.buffer());
-
-        std::size_t offset = max_frame_size_;
-        while (offset < block.size()) {
-            const std::size_t n = std::min<std::size_t>(max_frame_size_, block.size() - offset);
-            const bool last = offset + n == block.size();
-            FrameWriter continuation;
-            continuation.continuation(stream_id, block.substr(offset, n), last);
-            write_buffer_.append(continuation.buffer());
-            offset += n;
-        }
-    }
+    append_headers(write_buffer_, stream_id, block, end_stream, max_frame_size_);
     schedule_flush();
 }
 
 void H2Connection::append_data(std::uint32_t stream_id, std::string_view data, bool end_stream)
 {
-    char h[9];
-    const std::size_t length = data.size();
-    h[0] = static_cast<char>((length >> 16) & 0xff);
-    h[1] = static_cast<char>((length >> 8) & 0xff);
-    h[2] = static_cast<char>(length & 0xff);
-    h[3] = static_cast<char>(FrameType::Data);
-    h[4] = static_cast<char>(end_stream ? kFlagEndStream : 0);
-    h[5] = static_cast<char>((stream_id >> 24) & 0x7f);
-    h[6] = static_cast<char>((stream_id >> 16) & 0xff);
-    h[7] = static_cast<char>((stream_id >> 8) & 0xff);
-    h[8] = static_cast<char>(stream_id & 0xff);
-
-    write_buffer_.append(h, sizeof(h));
-    if (!data.empty())
-        write_buffer_.append(data);
+    append_frame_header(write_buffer_, FrameType::Data, end_stream ? kFlagEndStream : 0, stream_id, data.size());
+    write_buffer_.append(data);
 }
 
 void H2Connection::send_rst(std::uint32_t stream_id, ErrorCode code)
@@ -1306,7 +1252,7 @@ void H2Connection::finish_headers(std::uint32_t stream_id, std::string_view bloc
     ResponseHead head;
 
     if (mode_ == WireMode::Native) {
-        std::vector<native::HeaderView> views;
+        std::vector<native::HeaderView> &views = native_views_;
         native::ResponseHead decoded;
         if (!native::decode_response(block, views, decoded, native::kMaxHeaders, native::kMaxBlock)) {
             send_goaway(ErrorCode::Protocol);

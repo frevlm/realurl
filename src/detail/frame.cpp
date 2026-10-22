@@ -56,14 +56,43 @@ ParseResult FrameParser::next(std::string_view data, std::size_t &offset, Frame 
     return ParseResult::Ok;
 }
 
+void append_frame_header(std::string &out, FrameType type, std::uint8_t flags, std::uint32_t stream_id,
+                         std::size_t length)
+{
+    const char header[9] = {
+        static_cast<char>((length >> 16) & 0xff),
+        static_cast<char>((length >> 8) & 0xff),
+        static_cast<char>(length & 0xff),
+        static_cast<char>(type),
+        static_cast<char>(flags),
+        static_cast<char>((stream_id >> 24) & 0x7f),
+        static_cast<char>((stream_id >> 16) & 0xff),
+        static_cast<char>((stream_id >> 8) & 0xff),
+        static_cast<char>(stream_id & 0xff),
+    };
+    out.append(header, sizeof(header));
+}
+
+void append_headers(std::string &out, std::uint32_t stream_id, std::string_view block, bool end_stream,
+                    std::size_t max_frame_size)
+{
+    FrameType type = FrameType::Headers;
+    std::uint8_t flags = end_stream ? kFlagEndStream : 0;
+    do {
+        const std::string_view chunk = block.substr(0, max_frame_size);
+        block.remove_prefix(chunk.size());
+        if (block.empty())
+            flags |= kFlagEndHeaders;
+        append_frame_header(out, type, flags, stream_id, chunk.size());
+        out.append(chunk);
+        type = FrameType::Continuation;
+        flags = 0;
+    } while (!block.empty());
+}
+
 void FrameWriter::write_header(FrameType type, std::uint8_t flags, std::uint32_t stream_id, std::size_t length)
 {
-    buffer_.push_back(static_cast<char>((length >> 16) & 0xff));
-    buffer_.push_back(static_cast<char>((length >> 8) & 0xff));
-    buffer_.push_back(static_cast<char>(length & 0xff));
-    buffer_.push_back(static_cast<char>(type));
-    buffer_.push_back(static_cast<char>(flags));
-    append_u32(buffer_, stream_id & 0x7fffffffu);
+    append_frame_header(buffer_, type, flags, stream_id, length);
 }
 
 void FrameWriter::data(std::uint32_t stream_id, std::string_view payload, bool end_stream)

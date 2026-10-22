@@ -81,6 +81,9 @@ private:
     int fd_ = -1;
     IoWaiter *read_waiter_ = nullptr;
     IoWaiter *write_waiter_ = nullptr;
+    /// False once a recv has drained the socket; the next read edge sets it.
+    /// read() then parks without a recv that would only return EAGAIN.
+    bool readable_ = true;
 };
 
 struct ListenerOptions {

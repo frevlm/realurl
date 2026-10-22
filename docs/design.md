@@ -44,6 +44,13 @@ thread-local size-class cache (`detail/coro_pool.hpp`) serves frames up to
 removes the malloc/free pair that every helper `co_await`
 (`head`/`read`/`write`/`end`) would otherwise pay.
 
+Every local that lives across a `co_await` is stored in the frame. Classes of
+4 KiB and above cache only 256 frames per thread, so a hot-path coroutine must
+not hold a large stack buffer across an await: at high concurrency the frame
+falls out of the cache and every call pays a large malloc/free. Buffered
+request and response bodies therefore drain straight from the stream's queue
+into the destination string instead of going through a local buffer.
+
 ## Event loop
 
 | Platform | Backend | Wakeup |
@@ -54,10 +61,15 @@ removes the malloc/free pair that every helper `co_await`
 Sockets register read/write interest once, when the `TcpStream` is created,
 and never unregister it per operation. `TcpStream` keeps at most one parked
 reader and one parked writer; the poller callback resumes the parked coroutine
-(or drops the edge when nothing is waiting). Every operation tries the syscall
-first, so an edge consumed while no awaiter was parked is harmless. This
-removes the `epoll_ctl`/`kevent` pair that a per-wait registration would cost
-on every EAGAIN.
+(or drops the edge when nothing is waiting). Writes try the syscall first.
+Reads track readiness instead: a stream `recv` returns everything queued up to
+the buffer size, so a short read means the socket is drained, and the next
+`read()` parks without a `recv` that would only return EAGAIN. Every read edge
+marks the stream readable, whether or not a reader is parked, so an edge that
+arrives while nothing waits is never lost. This removes the
+`epoll_ctl`/`kevent` pair that a per-wait registration would cost, and the
+wasted `recv` per wakeup. TLS streams read through `SSL_read` and keep the
+try-first loop.
 
 Timer wheel is a `priority_queue` with lazy cancellation (`TimerId` set).
 `run_once()` order: posted callbacks → due timers → poll (timeout clamped to
@@ -69,10 +81,17 @@ resume ready batch.
 ### Frames
 
 `FrameParser` validates the 9-byte header, enforces `max_frame_size`, and
-returns views into the read buffer (zero-copy framing). `FrameWriter` appends
-encoded frames to the connection's outbound buffer. HEADERS exceeding the
+returns views into the read buffer (zero-copy framing). `append_frame_header`
+and `append_headers` write frames straight into the connection's outbound
+buffer; `FrameWriter` builds the rare control frames. HEADERS exceeding the
 frame limit are split into CONTINUATION frames; the reader enforces that no
 other frame type may appear inside a header sequence.
+
+Each stream buffers its outgoing and incoming body bytes in a `ByteQueue`, one
+contiguous buffer with a read cursor. The writer sends one frame per stream
+turn, and END_STREAM rides on the frame that carries the last queued byte, so
+a unary response is HEADERS + one DATA frame, and an empty body ends on
+HEADERS.
 
 ### HPACK
 
@@ -116,8 +135,8 @@ credit correctly and wake every suspended waiter exactly once.
 
 ### Pool
 
-`ClientImpl` keeps, per origin key (`scheme://authority` plus pinned IP), up
-to `Config::max_conns_per_origin` connections. Selection prefers the
+`ClientImpl` keeps, per origin key (`scheme://host:port`, built in a reused
+buffer so a lookup does not allocate), up to `Config::max_conns_per_origin` connections. Selection prefers the
 connection with the fewest active streams under the peer's
 `MAX_CONCURRENT_STREAMS`; unusable connections (GOAWAY, error) are dropped
 lazily. A cold pool coalesces connection attempts: the first request starts

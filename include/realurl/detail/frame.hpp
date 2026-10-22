@@ -53,6 +53,15 @@ private:
     std::uint32_t max_frame_size_;
 };
 
+/// Append a 9-byte frame header to `out`.
+void append_frame_header(std::string &out, FrameType type, std::uint8_t flags, std::uint32_t stream_id,
+                         std::size_t length);
+
+/// Append a header block as HEADERS plus CONTINUATION frames of at most
+/// max_frame_size bytes each.
+void append_headers(std::string &out, std::uint32_t stream_id, std::string_view block, bool end_stream,
+                    std::size_t max_frame_size);
+
 class FrameWriter {
 public:
     void data(std::uint32_t stream_id, std::string_view payload, bool end_stream);

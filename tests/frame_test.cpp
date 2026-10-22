@@ -88,5 +88,47 @@ int main()
         CHECK(parser.next(oversized, offset, frame) == ParseResult::Error);
     }
 
+    {
+        // A 10-byte block at max_frame_size 4 becomes HEADERS(4) +
+        // CONTINUATION(4) + CONTINUATION(2, END_HEADERS).
+        std::string out;
+        append_headers(out, 5, "0123456789", true, 4);
+
+        FrameParser parser;
+        std::size_t offset = 0;
+        Frame frame;
+        std::vector<Frame> frames;
+        while (parser.next(out, offset, frame) == ParseResult::Ok)
+            frames.push_back(frame);
+        CHECK(offset == out.size());
+        CHECK(frames.size() == 3);
+        if (frames.size() == 3) {
+            CHECK(frames[0].header.type == FrameType::Headers);
+            CHECK(frames[0].header.flags == kFlagEndStream);
+            CHECK(frames[0].payload == "0123");
+            CHECK(frames[1].header.type == FrameType::Continuation);
+            CHECK(frames[1].header.flags == 0);
+            CHECK(frames[1].payload == "4567");
+            CHECK(frames[2].header.type == FrameType::Continuation);
+            CHECK(frames[2].header.flags == kFlagEndHeaders);
+            CHECK(frames[2].payload == "89");
+            CHECK(frames[2].header.stream_id == 5);
+        }
+    }
+
+    {
+        std::string out;
+        append_headers(out, 7, "", false, 16384);
+
+        FrameParser parser;
+        std::size_t offset = 0;
+        Frame frame;
+        CHECK(parser.next(out, offset, frame) == ParseResult::Ok);
+        CHECK(frame.header.type == FrameType::Headers);
+        CHECK(frame.header.flags == kFlagEndHeaders);
+        CHECK(frame.header.length == 0);
+        CHECK(offset == out.size());
+    }
+
     return test::summary();
 }

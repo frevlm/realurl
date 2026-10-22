@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace realurl::detail
 {
@@ -42,7 +43,6 @@ public:
         return context_;
     }
 
-    void queue_headers(std::uint32_t stream_id, std::string_view block, bool end_stream);
     void append_data(std::uint32_t stream_id, std::string_view data, bool end_stream);
     void send_rst(std::uint32_t stream_id, h2::ErrorCode code);
     void send_window_update(std::uint32_t stream_id, std::uint32_t increment);
@@ -66,9 +66,10 @@ public:
         return max_frame_size_;
     }
 
-    /// Encode an HTTP/2 or native response head into `out`.
-    bool encode_response_head(int status, std::span<const Header> headers,
-                              std::optional<std::uint64_t> content_length, std::string &out);
+    /// Encode an HTTP/2 or native response head and queue its HEADERS
+    /// frames. Returns false when the head cannot be encoded.
+    bool send_response_head(std::uint32_t stream_id, int status, std::span<const Header> headers,
+                            std::optional<std::uint64_t> content_length, bool end_stream);
 
 private:
     friend class H2ServerStream;
@@ -87,6 +88,8 @@ private:
     void handle_window_update(const h2::Frame &frame);
     void handle_goaway(std::string_view payload);
     void send_goaway(h2::ErrorCode code);
+    bool encode_response_head(int status, std::span<const Header> headers,
+                              std::optional<std::uint64_t> content_length, std::string &out);
 
     ServerContext &context_;
     EventLoop &loop_;
@@ -105,6 +108,8 @@ private:
     std::string write_buffer_;
     std::string out_buffer_;
     std::string continuation_block_;
+    std::string head_scratch_;
+    std::vector<Header> header_scratch_;
     std::uint32_t continuation_stream_ = 0;
     bool continuation_end_stream_ = false;
     bool expecting_continuation_ = false;

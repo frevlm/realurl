@@ -10,6 +10,7 @@ target_include_directories(realurl_test_support PUBLIC "${CMAKE_CURRENT_SOURCE_D
 target_link_libraries(realurl_test_support PUBLIC realurl::core OpenSSL::SSL OpenSSL::Crypto realurl_warnings)
 
 realurl_add_test(buffer_pool_test)
+realurl_add_test(byte_queue_test)
 realurl_add_test(body_feeder_test)
 realurl_add_test(rate_limit_test)
 realurl_add_test(pump_pool_test)
