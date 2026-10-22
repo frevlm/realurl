@@ -2,15 +2,20 @@
 
 /// Process resource sampling for benchmarks: RSS and CPU time.
 
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 
 #include <cstdint>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <net/if_dl.h>
 #else
 #include <cstdio>
+#include <linux/if_link.h>
 #include <unistd.h>
 #endif
 
@@ -61,6 +66,30 @@ struct CpuTime {
         return user + system;
     }
 };
+
+/// Bytes sent on loopback interfaces, including TCP/IP headers. The kernel
+/// counter is 32-bit; subtract two samples as uint32_t, so a delta is exact
+/// below 4 GiB.
+inline std::uint32_t loopback_tx_bytes()
+{
+    ifaddrs *list = nullptr;
+    if (::getifaddrs(&list) != 0)
+        return 0;
+    std::uint32_t total = 0;
+    for (const ifaddrs *entry = list; entry != nullptr; entry = entry->ifa_next) {
+        if (entry->ifa_addr == nullptr || entry->ifa_data == nullptr || (entry->ifa_flags & IFF_LOOPBACK) == 0)
+            continue;
+#if defined(__APPLE__)
+        if (entry->ifa_addr->sa_family == AF_LINK)
+            total += static_cast<const if_data *>(entry->ifa_data)->ifi_obytes;
+#else
+        if (entry->ifa_addr->sa_family == AF_PACKET)
+            total += static_cast<const rtnl_link_stats *>(entry->ifa_data)->tx_bytes;
+#endif
+    }
+    ::freeifaddrs(list);
+    return total;
+}
 
 inline CpuTime cpu_time()
 {

@@ -7,6 +7,37 @@ the clocks, so percentiles reflect steady state. RSS/CPU include the in-tree
 test server that runs in the same process. The tables below the architecture
 pass are the original 0.3 baseline.
 
+## TLS session resumption
+
+`tls_connect` opens sequential new TLS connections to a realurl `Server`:
+TCP connect, handshake, h2 preface, and the server's first SETTINGS frame.
+`full` gives every connection an empty session cache; `resume` shares one
+warmed `TlsContext`, so every handshake resumes (2000/2000 in every run).
+Apple M5 / macOS, loopback, Release build, OpenSSL 3, TLS 1.3, 2000
+connections, median of 3 runs (spread under 1%). CPU is client plus server
+in the same process; wire bytes come from the loopback interface counter and
+include TCP/IP headers.
+
+| Server certificate | Handshake | conn/s | p50 | p99 | CPU/conn | Wire/conn |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| ECDSA P-256 (`tests/certs`) | full | 2,378 | 0.417 ms | 0.451 ms | 461 µs | 5,290 B |
+| ECDSA P-256 | resume | 2,789 | 0.355 ms | 0.401 ms | 386 µs | 4,670 B |
+| RSA 2048 | full | 1,274 | 0.786 ms | 0.952 ms | 716 µs | 5,766 B |
+| RSA 2048 | resume | 2,796 | 0.354 ms | 0.443 ms | 382 µs | 4,668 B |
+
+Resumption skips the certificate signature and its verification, so its cost
+does not depend on the certificate: about 0.35 ms either way. That saves 15%
+of handshake latency and 16% of CPU with ECDSA, and 55% of latency and 47% of
+CPU with RSA 2048, plus the certificate bytes. Without 0-RTT a TLS 1.3
+resumption still takes one round trip, the same as a full handshake, so on a
+real network the win is CPU and bytes, not round trips.
+
+```sh
+./build-release/bench/realurl_bench tls_connect 2000 full
+./build-release/bench/realurl_bench tls_connect 2000 resume
+./build-release/bench/realurl_bench tls_connect 2000 resume rsa.pem rsa-key.pem
+```
+
 ## Two-end hot path (0.5.x)
 
 Measured on Apple M5 / macOS, loopback, Release build. `base` is commit
@@ -172,6 +203,25 @@ cmake --build build --target realurl_bench
 `native_llm` uses a realurl `Server` endpoint for both protocols; the
 historical `llm` mode still uses the in-tree h2-only test server and is not
 directly comparable to these A/B numbers.
+
+## Frame size and TCP_NOTSENT_LOWAT (not adopted)
+
+`native_bulk <requests> <concurrency> <body_kib> <connections> <protocol>` does
+a POST of `body_kib` and reads the same number of bytes back through a realurl
+`Server`. Apple M5 / macOS, loopback, Release build, medians of 3 interleaved
+runs, `native_bulk 1000 8 2048 1 native` (other agents were loading the host, so
+run-to-run spread is about +/-15%).
+
+| Native SETTINGS_MAX_FRAME_SIZE | 2 MiB bulk MB/s (each way) | 64 KiB bulk MB/s | `native_llm` TTFT p50 |
+|---|---:|---:|---:|
+| 16 KiB (current) | 2028 | 2263 | 93 ms |
+| 64 KiB | 2013 | 2138 | 116 ms |
+| 256 KiB | 2121 | 1798 | 104 ms |
+
+No measurable win, so native mode keeps 16 KiB. `TCP_NOTSENT_LOWAT = 16 KiB` on
+both ends gave a bulk median of 770 MB/s against 850 MB/s without (6 interleaved
+runs) and an unresolved TTFT difference (150 ms vs 160 ms, 3 runs), so it is not
+applied either.
 
 ## Single-runtime server (0.4)
 

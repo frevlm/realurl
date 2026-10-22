@@ -84,6 +84,8 @@ private:
     void handle_settings(std::string_view payload, bool ack);
     void handle_headers(const h2::Frame &frame);
     void finish_headers(std::uint32_t stream_id, std::string_view block, bool end_stream);
+    void open_stream(std::uint32_t stream_id, std::string_view block, h2::HeaderList &&headers, bool end_stream);
+    void deliver_headers(H2ServerStream &stream, std::string_view block, h2::HeaderList &&headers, bool end_stream);
     void handle_data(const h2::Frame &frame);
     void handle_window_update(const h2::Frame &frame);
     void handle_goaway(std::string_view payload);

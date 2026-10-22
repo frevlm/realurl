@@ -1,6 +1,7 @@
 #include "resource.hpp"
 #include "support/h2_test_server.hpp"
 #include "realurl/asio_bridge.hpp"
+#include "realurl/detail/tls.hpp"
 #include "realurl/http2.hpp"
 #include "realurl/proxy.hpp"
 #include "realurl/server.hpp"
@@ -25,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -800,11 +802,132 @@ int free_port()
     return port;
 }
 
+/// Client preface plus an empty SETTINGS frame.
+constexpr std::string_view kH2Hello("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                                    "\x00\x00\x00\x04\x00\x00\x00\x00\x00",
+                                    24 + 9);
+
+realurl::detail::SocketAddress tls_loopback(int port)
+{
+    realurl::detail::SocketAddress address;
+    auto *in = reinterpret_cast<sockaddr_in *>(&address.storage);
+    in->sin_family = AF_INET;
+    in->sin_port = htons(static_cast<std::uint16_t>(port));
+    ::inet_pton(AF_INET, "127.0.0.1", &in->sin_addr);
+    address.length = sizeof(sockaddr_in);
+    return address;
+}
+
+/// One TLS connection: TCP connect, handshake, h2 preface, and the server's
+/// SETTINGS frame, which also delivers the session ticket. Returns -1 on
+/// failure, else whether the handshake resumed.
+realurl::Task<int> tls_hello(std::shared_ptr<realurl::detail::TlsContext> context, int port)
+{
+    try {
+        auto transport = co_await realurl::detail::TlsStream::connect(
+            realurl::EventLoop::current(), tls_loopback(port), "localhost", context, 5s);
+        auto &stream = static_cast<realurl::detail::TlsStream &>(*transport);
+        co_await stream.write_all(kH2Hello, 5s);
+        char frame[9];
+        std::size_t have = 0;
+        while (have < sizeof(frame)) {
+            const std::size_t n = co_await stream.read({ frame + have, sizeof(frame) - have }, 5s);
+            if (n == 0)
+                co_return -1;
+            have += n;
+        }
+        co_return stream.resumed() ? 1 : 0;
+    } catch (...) {
+        co_return -1;
+    }
+}
+
+struct TlsConnectResult {
+    std::vector<double> latencies;
+    int resumed = 0;
+    int failed = 0;
+};
+
+realurl::Task<void> tls_connect_all(const std::vector<std::shared_ptr<realurl::detail::TlsContext>> &contexts,
+                                    int port, TlsConnectResult &result)
+{
+    for (const auto &context : contexts) {
+        const auto start = std::chrono::steady_clock::now();
+        const int outcome = co_await tls_hello(context, port);
+        result.latencies.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        if (outcome < 0)
+            ++result.failed;
+        else
+            result.resumed += outcome;
+    }
+}
+
+/// Sequential new TLS connections to a realurl Server. `resume` shares one
+/// warmed TlsContext, so every handshake resumes its cached session; `full`
+/// gives each connection a fresh context and a full handshake. Contexts are
+/// created before timing starts.
+int run_tls_connect(int total, bool resume, const std::string &cert, const std::string &key)
+{
+    using realurl::detail::TlsContext;
+    total = std::max(1, total);
+
+    const int port = free_port();
+    if (port <= 0) {
+        std::fprintf(stderr, "tls_connect: cannot reserve a local port\n");
+        return 1;
+    }
+
+    realurl::Server server;
+    server.set_io_threads(1);
+    server.set_tls(cert, key);
+    std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
+    for (int i = 0; i < 1000 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(1ms);
+    if (!server.is_running()) {
+        server.stop();
+        listener.join();
+        std::fprintf(stderr, "tls_connect: server failed to start\n");
+        return 1;
+    }
+
+    std::vector<std::shared_ptr<TlsContext>> contexts;
+    const std::vector<std::shared_ptr<TlsContext>> warmup{ TlsContext::create(cert, false) };
+    if (resume)
+        contexts.assign(static_cast<std::size_t>(total), warmup.front());
+    for (int i = 0; !resume && i < total; ++i)
+        contexts.push_back(TlsContext::create(cert, false));
+    TlsConnectResult warm;
+    realurl::sync_wait(tls_connect_all(warmup, port, warm));
+
+    TlsConnectResult result;
+    const std::uint32_t wire_start = bench::loopback_tx_bytes();
+    const bench::CpuTime cpu_start = bench::cpu_time();
+    const auto wall_start = std::chrono::steady_clock::now();
+    realurl::sync_wait(tls_connect_all(contexts, port, result));
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+    const bench::CpuTime cpu_end = bench::cpu_time();
+    const std::uint32_t wire = bench::loopback_tx_bytes() - wire_start;
+
+    const std::vector<double> pct = percentiles(result.latencies);
+    std::printf("mode=tls_connect handshake=%s connections=%d\n", resume ? "resume" : "full", total);
+    std::printf("  status: %d ok, %d failed, %d resumed in %.2fs (%.0f conn/s)\n", total - result.failed,
+                result.failed, result.resumed, wall, total / wall);
+    std::printf("  latency ms: p50=%.3f p90=%.3f p99=%.3f max=%.3f\n", pct[0], pct[1], pct[3], pct[5]);
+    std::printf("  cpu: total=%.2fs (%.1f us/conn, client + server)\n", cpu_end.total() - cpu_start.total(),
+                (cpu_end.total() - cpu_start.total()) * 1e6 / total);
+    std::printf("  wire: %.0f B/conn on loopback\n", static_cast<double>(wire) / total);
+
+    server.stop();
+    listener.join();
+    return result.failed == 0 ? 0 : 1;
+}
+
 /// Same workload as run_llm(), but the endpoint is a realurl Server so both
 /// the HTTP/2 and native transports can be compared against identical server
 /// code. The server streams 1 KiB over duration_seconds chunks.
 int run_server_llm(int total, int concurrency, int duration_seconds, bool streaming, int connections,
-                   realurl::Protocol protocol)
+                   realurl::Protocol protocol, std::size_t body_bytes = 2 * 1024 * 1024, bool bulk = false)
 {
     total = std::max(1, total);
     concurrency = std::max(1, concurrency);
@@ -819,14 +942,14 @@ int run_server_llm(int total, int concurrency, int duration_seconds, bool stream
 
     realurl::Server server;
     server.set_io_threads(1);
-    server.set_payload_max_length(4 * 1024 * 1024);
+    server.set_payload_max_length(std::max<std::size_t>(4 * 1024 * 1024, body_bytes * 2));
     server.set_read_header_timeout(0ms);
     server.set_client_write_timeout(std::chrono::seconds(duration_seconds + 60));
 
     server.Get("/llm", [](const auto &, auto &response) { response.set_content("ok"); });
-    server.Post("/llm", [duration_seconds, streaming](const realurl::Server::Request &request,
+    server.Post("/llm", [duration_seconds, streaming, bulk, body_bytes](const realurl::Server::Request &request,
                                                        realurl::Server::Response &response) {
-        response.take_over_task([duration_seconds, streaming, &request](
+        response.take_over_task([duration_seconds, streaming, bulk, body_bytes, &request](
                                     realurl::server::StreamWriter &writer) -> realurl::Task<void> {
             const realurl::server::Header headers[] = { { "content-type", "text/plain" } };
             co_await writer.write_head(200, headers, std::nullopt);
@@ -850,7 +973,7 @@ int run_server_llm(int total, int concurrency, int duration_seconds, bool stream
             } else {
                 if (duration_seconds > 0)
                     co_await request.loop->sleep_for(std::chrono::seconds(duration_seconds));
-                co_await writer.write(std::string(1024, 'T'));
+                co_await writer.write(std::string(bulk ? body_bytes : 1024, 'T'));
             }
             co_await writer.end();
         });
@@ -873,7 +996,7 @@ int run_server_llm(int total, int concurrency, int duration_seconds, bool stream
     config.max_streams_per_conn = (concurrency + connections - 1) / connections;
     realurl::Client client(loop, config);
     const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/llm";
-    const std::string prompt_2mb(2 * 1024 * 1024, 'P');
+    const std::string prompt_2mb(body_bytes, 'P');
 
     std::atomic<int> remaining{ total };
     std::atomic<int> completed{ 0 };
@@ -921,10 +1044,11 @@ int run_server_llm(int total, int concurrency, int duration_seconds, bool stream
     std::printf("  status: %d passed, %d failed in %.2fs (%.2f req/s, %.1f RPM)\n",
                 total - failed_count.load(), failed_count.load(), wall, total / wall,
                 (total / wall) * 60.0);
-    std::printf("  data: %.1f MB uploaded (%.1f MB/s), %.1f KB downloaded\n",
+    std::printf("  data: %.1f MB uploaded (%.1f MB/s), %.1f KB downloaded (%.1f MB/s)\n",
                 total_uploaded.load() / (1024.0 * 1024.0),
                 (total_uploaded.load() / (1024.0 * 1024.0)) / wall,
-                total_downloaded.load() / 1024.0);
+                total_downloaded.load() / 1024.0,
+                (total_downloaded.load() / (1024.0 * 1024.0)) / wall);
     if (!pct_ttft.empty())
         std::printf("  ttft ms:   p50=%.1f p90=%.1f p95=%.1f p99=%.1f max=%.1f\n", pct_ttft[0],
                     pct_ttft[1], pct_ttft[2], pct_ttft[3], pct_ttft[5]);
@@ -1776,6 +1900,26 @@ int main(int argc, char **argv)
         return run_server_llm(total, concurrency, duration, streaming, connections,
                               native ? realurl::Protocol::Native : realurl::Protocol::Http2);
     }
+    if (mode == "tls_connect") {
+        // tls_connect <connections> [full|resume] [cert] [key]
+        const int total = argc > 2 ? std::atoi(argv[2]) : 2000;
+        const bool resume = argc > 3 ? std::string(argv[3]) == "resume" : true;
+        const std::string cert = argc > 4 ? argv[4] : REALURL_CERT_DIR "/localhost.pem";
+        const std::string key = argc > 5 ? argv[5] : REALURL_CERT_DIR "/localhost-key.pem";
+        return run_tls_connect(total, resume, cert, key);
+    }
+    if (mode == "native_bulk") {
+        // native_bulk <requests> <concurrency> <body_kib> <connections> <protocol>
+        const int total = argc > 2 ? std::atoi(argv[2]) : 200;
+        const int concurrency = argc > 3 ? std::atoi(argv[3]) : 8;
+        const int body_kib = argc > 4 ? std::atoi(argv[4]) : 2048;
+        const int connections = argc > 5 ? std::atoi(argv[5]) : 1;
+        const bool native =
+            argc > 6 ? (std::string(argv[6]) == "native" || std::string(argv[6]) == "1") : true;
+        return run_server_llm(total, concurrency, 0, false, connections,
+                              native ? realurl::Protocol::Native : realurl::Protocol::Http2,
+                              static_cast<std::size_t>(std::max(1, body_kib)) * 1024, true);
+    }
     if (mode == "pump" || mode == "async") {
         const int concurrency = argc > 2 ? std::atoi(argv[2]) : 128;
         const int chunks = argc > 3 ? std::atoi(argv[3]) : 10;
@@ -1811,6 +1955,8 @@ int main(int argc, char **argv)
                  "usage: %s requests <N> <concurrency> [connections] | requests_mt <N> <concurrency> <workers> "
                  "[connections] | h2_unary|native_unary <N> <concurrency> <workers> [h2|native] | hold <streams> | llm <total> <concurrency> [duration_s] [streaming] [connections] "
                  "| native_llm <total> <concurrency> [duration_s] [streaming] [connections] [h2|native] "
+                 "| native_bulk <N> <concurrency> [body_kib] [connections] [h2|native] "
+                 "| tls_connect <N> [full|resume] [cert] [key] "
                  "| pump <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| async <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| proxy <concurrency> [chunks] [interval_ms] [timeout_ms] [workers] [bridge|block] "

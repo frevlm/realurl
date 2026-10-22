@@ -188,11 +188,11 @@ class H2ServerStream final : public StreamWriter,
                              public std::enable_shared_from_this<H2ServerStream>
 {
 public:
-    H2ServerStream(H2ServerConnection &connection, std::uint32_t id)
+    H2ServerStream(H2ServerConnection &connection, std::uint32_t id, std::uint32_t initial_window)
         : connection_(&connection)
         , loop_(&connection.loop())
         , id_(id)
-        , send_window_(h2::kDefaultInitialWindowSize)
+        , send_window_(initial_window)
     {
     }
 
@@ -726,53 +726,52 @@ void H2ServerConnection::finish_headers(std::uint32_t stream_id, std::string_vie
         return;
     }
 
-    auto it = streams_.find(stream_id);
-
-    if (mode_ == WireMode::Native) {
-        if (it == streams_.end()) {
-            if (active_streams_ >= kMaxStreams) {
-                send_rst(stream_id, h2::ErrorCode::RefusedStream);
-                return;
-            }
-
-            auto stream = std::make_shared<H2ServerStream>(*this, stream_id);
-            streams_.emplace(stream_id, stream);
-            ++active_streams_;
-            stream->on_native_headers(std::string(block), end_stream);
-            if (stream->done())
-                return;
-            loop_.spawn(stream->run_handler());
-            return;
-        }
-
-        it->second->on_native_headers(std::string(block), end_stream);
-        return;
-    }
-
+    // Every HPACK block advances the decoder, so HTTP/2 decodes it before
+    // looking at the stream.
     h2::HeaderList headers;
-    if (!decoder_.decode(block, headers, 65536)) {
+    if (mode_ != WireMode::Native && !decoder_.decode(block, headers, 65536)) {
         send_goaway(h2::ErrorCode::Compression);
         close_with_error(EPROTO);
         return;
     }
 
+    const auto it = streams_.find(stream_id);
     if (it == streams_.end()) {
-        if (active_streams_ >= kMaxStreams) {
-            send_rst(stream_id, h2::ErrorCode::RefusedStream);
-            return;
-        }
+        open_stream(stream_id, block, std::move(headers), end_stream);
+        return;
+    }
+    // A closed stream stays in the map until the writer reaps it. HEADERS on
+    // it is a stream error (RFC 9113 section 5.1).
+    if (it->second->done()) {
+        send_rst(stream_id, h2::ErrorCode::StreamClosed);
+        return;
+    }
+    deliver_headers(*it->second, block, std::move(headers), end_stream);
+}
 
-        auto stream = std::make_shared<H2ServerStream>(*this, stream_id);
-        streams_.emplace(stream_id, stream);
-        ++active_streams_;
-        stream->on_headers(std::move(headers), end_stream);
-        if (stream->done())
-            return;
-        loop_.spawn(stream->run_handler());
+void H2ServerConnection::open_stream(std::uint32_t stream_id, std::string_view block, h2::HeaderList &&headers,
+                                     bool end_stream)
+{
+    if (active_streams_ >= kMaxStreams) {
+        send_rst(stream_id, h2::ErrorCode::RefusedStream);
         return;
     }
 
-    it->second->on_headers(std::move(headers), end_stream);
+    auto stream = std::make_shared<H2ServerStream>(*this, stream_id, peer_initial_window_);
+    streams_.emplace(stream_id, stream);
+    ++active_streams_;
+    deliver_headers(*stream, block, std::move(headers), end_stream);
+    if (!stream->done())
+        loop_.spawn(stream->run_handler());
+}
+
+void H2ServerConnection::deliver_headers(H2ServerStream &stream, std::string_view block, h2::HeaderList &&headers,
+                                         bool end_stream)
+{
+    if (mode_ == WireMode::Native)
+        stream.on_native_headers(std::string(block), end_stream);
+    else
+        stream.on_headers(std::move(headers), end_stream);
 }
 
 void H2ServerConnection::handle_data(const h2::Frame &frame)
@@ -800,18 +799,20 @@ void H2ServerConnection::handle_data(const h2::Frame &frame)
         data.remove_suffix(pad);
     }
 
+    // The connection window accounts for every DATA frame, including frames
+    // for streams that are gone.
+    recv_unacked_ += frame.header.length;
+    if (recv_unacked_ >= kWindowUpdateThreshold) {
+        send_window_update(0, recv_unacked_);
+        recv_unacked_ = 0;
+    }
+
     const auto it = streams_.find(frame.header.stream_id);
     if (it == streams_.end()) {
         send_rst(frame.header.stream_id, h2::ErrorCode::StreamClosed);
         return;
     }
     it->second->on_data(data, (frame.header.flags & h2::kFlagEndStream) != 0, frame.header.length);
-
-    recv_unacked_ += frame.header.length;
-    if (recv_unacked_ >= kWindowUpdateThreshold) {
-        send_window_update(0, recv_unacked_);
-        recv_unacked_ = 0;
-    }
 }
 
 void H2ServerConnection::handle_window_update(const h2::Frame &frame)
@@ -1086,6 +1087,8 @@ void H2ServerStream::finish_request_head(std::string_view method, std::string_vi
 
 void H2ServerStream::on_headers(h2::HeaderList &&headers, bool end_stream)
 {
+    if (closed_)
+        return;
     if (head_ready_) {
         remote_closed_ = remote_closed_ || end_stream;
         if (end_stream) {
@@ -1120,6 +1123,8 @@ void H2ServerStream::on_headers(h2::HeaderList &&headers, bool end_stream)
 
 void H2ServerStream::on_native_headers(std::string block, bool end_stream)
 {
+    if (closed_)
+        return;
     if (head_ready_) {
         std::vector<native::HeaderView> trailers;
         if (!native::decode_trailers(block, trailers, native::kMaxHeaders, kMaxHeaderBlock)) {
@@ -1213,6 +1218,10 @@ void H2ServerStream::on_rst()
 
 void H2ServerStream::on_window_update(std::uint32_t increment)
 {
+    // A closed stream stays in the map until the writer reaps it; the peer may
+    // still credit it, and there is nothing left to send.
+    if (closed_)
+        return;
     if (send_window_ + static_cast<std::int64_t>(increment) > static_cast<std::int64_t>(kMaxWindow)) {
         fail(EPROTO);
         return;
@@ -1229,6 +1238,8 @@ void H2ServerStream::on_window_update(std::uint32_t increment)
 
 void H2ServerStream::on_settings_initial_window(std::int32_t delta)
 {
+    if (closed_)
+        return;
     send_window_ += delta;
     if (blocked_on_window_ && send_window_ > 0) {
         blocked_on_window_ = false;
@@ -1380,6 +1391,8 @@ void H2ServerStream::cancel()
 
 Task<void> H2ServerStream::send_error(int status)
 {
+    if (closed_)
+        co_return;
     Response response;
     response.status = status;
     connection_->context().apply_error_body(response, status);

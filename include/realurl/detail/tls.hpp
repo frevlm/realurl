@@ -20,8 +20,11 @@ namespace realurl::detail
 using SSL_CTX = ::ssl_ctx_st;
 using SSL = ::ssl_st;
 
-/// Process-wide TLS configuration. One instance is shared by every loop
-/// thread; SSL_CTX is thread-safe, SSL objects are not.
+class TlsSessionCache;
+
+/// Client TLS configuration, one per Client. SSL_CTX itself is thread-safe,
+/// but the session cache is not locked: a TlsContext must only be used by the
+/// loop thread that owns its Client.
 class TlsContext {
 public:
     /// `ca_file` may be empty, in which case the system trust store is used.
@@ -39,13 +42,15 @@ public:
         return ctx_;
     }
 
+    /// Binds `ssl` to the cache key (host:port) and offers the cached session
+    /// for that key, if any, for resumption.
+    void prepare(SSL *ssl, std::string key) const;
+
 private:
-    explicit TlsContext(SSL_CTX *ctx) noexcept
-        : ctx_(ctx)
-    {
-    }
+    TlsContext(SSL_CTX *ctx, std::unique_ptr<TlsSessionCache> cache) noexcept;
 
     SSL_CTX *ctx_;
+    std::unique_ptr<TlsSessionCache> cache_;
 };
 
 /// TLS stream: a TcpStream plus one SSL object. Only the connection's reader
@@ -76,12 +81,19 @@ public:
         return alpn_;
     }
 
+    /// True when the handshake resumed a cached session.
+    bool resumed() const noexcept
+    {
+        return resumed_;
+    }
+
 private:
-    TlsStream(TcpStream socket, SSL *ssl, std::string alpn);
+    TlsStream(TcpStream socket, SSL *ssl, std::string alpn, bool resumed);
 
     TcpStream socket_;
     SSL *ssl_ = nullptr;
     std::string alpn_;
+    bool resumed_ = false;
 };
 
 } // namespace realurl::detail
