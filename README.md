@@ -1,13 +1,12 @@
 # realurl
 
-A from-scratch HTTP/2 client in C++20: its own event loop, coroutines, HPACK,
-flow control, connection pool, and task scheduling. TLS 1.3 is the only
-dependency delegated to a library (BoringSSL).
+A from-scratch C++20 networking runtime: its own event loop, coroutines, HPACK,
+HTTP/2 framing/flow control, HTTP/1.1 parser, connection pool, TLS server/client
+and task scheduling. OpenSSL 3.x is the only dependency delegated to a library.
 
-realurl is the networking layer extracted from [revlm](https://github.com/FlowerRealm/revlm),
-rewritten in 0.3 to drop libcurl entirely. It speaks HTTP/2 only — no HTTP/1.1
-fallback, no HTTP/3 — and multiplexes every request over a small pool of
-long-lived connections.
+realurl is the networking layer extracted from [revlm](https://github.com/FlowerRealm/revlm).
+It provides an HTTP/2 client (the original 0.3 core) and, in 0.4, an HTTP/1.1 +
+HTTP/2 server with an in-loop streaming proxy. HTTP/3 is not supported.
 
 ## Public API
 
@@ -79,15 +78,18 @@ Rules:
 | Coroutine core | `detail/task.hpp`, `detail/coro_pool.hpp` | `Task<T>`, symmetric transfer, `sync_wait`, per-thread frame cache |
 | Event loop | `detail/event_loop.hpp`, `src/detail/poller_{epoll,kqueue}.cpp` | epoll on Linux, kqueue on macOS, edge-triggered persistent registration, timer heap |
 | Sockets | `detail/socket.hpp` | Non-blocking connect/read/write, listener, resolver |
-| TLS | `detail/tls.hpp`, BoringSSL | TLS 1.3, ALPN must be h2, SNI, certificate verification |
+| TLS | `detail/tls.cpp`, OpenSSL 3.x | TLS 1.2/1.3, ALPN (h2/http1.1), SNI, session tickets, kTLS hooks |
+| Server | `realurl/server.hpp`, `src/server/*` | H1 + H2 on the EventLoop, keep-alive, coroutine takeover, in-loop proxy |
+| io_uring | `detail/uring*.cpp` | multishot recv + provided buffers, Linux only, `REALURL_WITH_IO_URING` |
 | HTTP/2 | `detail/frame.hpp`, `detail/hpack.hpp`, `detail/connection.hpp` | Full HPACK (Huffman + dynamic table), flow control, GOAWAY/PING/RST |
 | Client | `realurl/http2.hpp`, `detail/client.hpp`, `detail/client_group.cpp` | Pool per origin with coalesced connection attempts, sharded `ClientGroup` |
-| io_uring (optional) | `detail/uring*.cpp` | Completion-based h2c transport, Linux only, `REALURL_WITH_IO_URING` |
+
 
 ## Build
 
 Requirements: CMake 3.20+, Clang 17+ (macOS AppleClang or Linux clang),
-Go (BoringSSL builds codegen during configure). POSIX only (Linux and macOS).
+OpenSSL 3.x development headers. macOS: `brew install openssl@3` and pass
+`-DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3`. POSIX only (Linux and macOS).
 GCC is not supported: its coroutine frontend ICEs on this codebase, including
 the current release.
 
@@ -105,10 +107,11 @@ Options:
 | `REALURL_BUILD_EXAMPLES` | `ON` | `fetch` and `stream` examples |
 | `REALURL_BUILD_BENCH` | `OFF` | Loopback h2c benchmark |
 | `REALURL_WITH_HTTPLIB` | `OFF` | cpp-httplib response-sink adapter |
-| `REALURL_WITH_IO_URING` | `OFF` | Completion-based h2c transport on Linux (raw UAPI, no liburing) |
+| `REALURL_WITH_IO_URING` | `OFF` | io_uring transport on Linux: multishot recv + provided buffers, one-shot send fallback |
 
-BoringSSL is fetched at a pinned commit on first configure (needs Go on
-`PATH`); all BoringSSL types stay inside `src/detail/tls.cpp`.
+OpenSSL types stay inside `src/detail/tls.cpp` and
+`src/detail/tls_server.cpp`. BoringSSL is no longer used because it does not
+expose kTLS or `SSL_sendfile`.
 
 ## Design notes
 

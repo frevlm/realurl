@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(realurl VERSION 0.3.0 LANGUAGES CXX)
+project(realurl VERSION 0.3.0 LANGUAGES C CXX)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   message(FATAL_ERROR "realurl requires Clang (GCC's coroutine frontend ICEs on this codebase)")
@@ -27,18 +27,31 @@ option(REALURL_WITH_IO_URING "Use the io_uring completion transport for h2c (Lin
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
-# BoringSSL: TLS 1.3 + ALPN only. Fetched at a pinned commit because BoringSSL
-# has no stable ABI and no system package.
+# OpenSSL 3.x: TLS 1.3, ALPN, and (Linux) kernel TLS. BoringSSL is not used
+# because it does not expose kTLS or SSL_sendfile.
 # ---------------------------------------------------------------------------
 
-include(FetchContent)
-set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+if(APPLE AND NOT OPENSSL_ROOT_DIR)
+  foreach(_openssl_prefix /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3)
+    if(EXISTS "${_openssl_prefix}/include/openssl/ssl.h")
+      set(OPENSSL_ROOT_DIR "${_openssl_prefix}" CACHE PATH "" FORCE)
+      break()
+    endif()
+  endforeach()
+endif()
 
-FetchContent_Declare(boringssl
-  GIT_REPOSITORY https://github.com/google/boringssl.git
-  GIT_TAG b50cad27ee8013f241648ef6a7adf7f6f6b3d25b)
-FetchContent_MakeAvailable(boringssl)
+find_package(OpenSSL 3.0 REQUIRED)
+
+if(OPENSSL_VERSION VERSION_LESS 3.0)
+  message(FATAL_ERROR "OpenSSL 3.0+ is required (found ${OPENSSL_VERSION})")
+endif()
+
+if(EXISTS "${OPENSSL_INCLUDE_DIR}/openssl/opensslv.h")
+  file(READ "${OPENSSL_INCLUDE_DIR}/openssl/opensslv.h" _realurl_opensslv)
+  if(_realurl_opensslv MATCHES "LIBRESSL_VERSION_NUMBER")
+    message(FATAL_ERROR "LibreSSL is not supported; install OpenSSL 3.x and set OPENSSL_ROOT_DIR")
+  endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # core: transport, event loop, HTTP/2 client. No Boost, no libcurl.
@@ -49,6 +62,7 @@ add_library(realurl_core
   src/fd_writer.cpp
   src/rate_limit.cpp
   src/detail/event_loop.cpp
+  src/detail/timer_wheel.cpp
   src/detail/socket.cpp
   src/detail/resolver.cpp
   src/detail/frame.cpp
@@ -58,6 +72,7 @@ add_library(realurl_core
   src/detail/client.cpp
   src/detail/client_group.cpp
   src/detail/tls.cpp
+  src/detail/tls_server.cpp
 )
 
 if(APPLE)
@@ -71,7 +86,7 @@ target_include_directories(realurl_core PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include>")
 target_link_libraries(realurl_core PUBLIC Threads::Threads)
-target_link_libraries(realurl_core PRIVATE ssl crypto realurl_warnings)
+target_link_libraries(realurl_core PRIVATE OpenSSL::SSL OpenSSL::Crypto realurl_warnings)
 
 if(REALURL_WITH_IO_URING)
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -82,13 +97,24 @@ if(REALURL_WITH_IO_URING)
 endif()
 
 # ---------------------------------------------------------------------------
-# server: HTTP/1.1 server built on Boost.Beast
+# server: HTTP/1.1 + HTTP/2 server on the realurl EventLoop
 # ---------------------------------------------------------------------------
 
 find_package(Boost 1.83 REQUIRED CONFIG)
 
+add_library(realurl_picohttpparser STATIC
+  third_party/picohttpparser/picohttpparser.c)
+target_include_directories(realurl_picohttpparser PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/picohttpparser")
+
 add_library(realurl_server
-  src/server.cpp
+  src/server/server.cpp
+  src/server/server_internal.cpp
+  src/server/router.cpp
+  src/server/http1_parser.cpp
+  src/server/http1_connection.cpp
+  src/server/proxy.cpp
+  src/server/h2_server.cpp
   src/stream_pump_pool.cpp
 )
 add_library(realurl::server ALIAS realurl_server)
@@ -96,7 +122,7 @@ target_include_directories(realurl_server PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include>")
 target_link_libraries(realurl_server PUBLIC realurl::core Boost::headers Threads::Threads)
-target_link_libraries(realurl_server PRIVATE realurl_warnings)
+target_link_libraries(realurl_server PRIVATE realurl_warnings realurl_picohttpparser)
 
 # ---------------------------------------------------------------------------
 # optional cpp-httplib adapter (header only)

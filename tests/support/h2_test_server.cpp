@@ -524,6 +524,23 @@ namespace realurl::test
 namespace
 {
 
+int select_h2_alpn(SSL *, const unsigned char **out, unsigned char *out_len,
+                   const unsigned char *in, unsigned int in_len, void *)
+{
+    for (unsigned int i = 0; i < in_len;) {
+        const unsigned int length = in[i++];
+        if (length == 0 || i + length > in_len)
+            break;
+        if (length == 2 && in[i] == 'h' && in[i + 1] == '2') {
+            *out = in + i;
+            *out_len = 2;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += length;
+    }
+    return SSL_TLSEXT_ERR_NOACK;
+}
+
 } // namespace
 
 void H2TlsTestServer::serve()
@@ -536,8 +553,7 @@ void H2TlsTestServer::serve()
         SSL_CTX_free(ctx);
         return;
     }
-    static const unsigned char kAlpn[] = { 2, 'h', '2' };
-    SSL_CTX_set_alpn_protos(ctx, kAlpn, sizeof(kAlpn));
+    SSL_CTX_set_alpn_select_cb(ctx, select_h2_alpn, nullptr);
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 
     struct ClientWorker {

@@ -7,6 +7,7 @@
 /// on the loop thread and takes no locks. Only post() crosses threads.
 
 #include "realurl/detail/task.hpp"
+#include "realurl/detail/timer_wheel.hpp"
 
 #include <chrono>
 #include <coroutine>
@@ -36,6 +37,14 @@ enum : std::uint32_t {
 
 using IoCallback = void (*)(void *ctx, std::uint32_t events);
 
+struct EventLoopStats {
+    std::uint64_t posts = 0;
+    std::uint64_t timer_callbacks = 0;
+    std::uint64_t io_events = 0;
+    std::uint64_t resumes = 0;
+    std::uint64_t poll_iterations = 0;
+};
+
 class EventLoop {
 public:
     EventLoop();
@@ -57,10 +66,20 @@ public:
     void stop();
     bool stopped() const noexcept;
 
+    /// Snapshot of per-loop counters. Safe to call from another thread.
+    EventLoopStats stats() const noexcept;
+
     /// Thread-safe: enqueue a callback on the loop thread.
     void post(std::function<void()> fn);
 
-    /// Loop-thread only. Returns an id usable with cancel().
+    /// Loop-thread only. Intrusive timer: the node lives in the caller's
+    /// frame/object, so scheduling and cancellation allocate nothing.
+    void schedule(TimerNode &node, std::chrono::nanoseconds delay, void (*callback)(void *),
+                  void *context);
+    void cancel(TimerNode &node) noexcept;
+
+    /// Compatibility wrapper for callers that want an id and std::function.
+    /// Prefer the intrusive overload on the hot path.
     TimerId schedule(std::chrono::nanoseconds delay, std::function<void()> fn);
     void cancel(TimerId id);
 
@@ -88,6 +107,10 @@ public:
     /// Lazily create the per-loop io_uring. Returns nullptr when the kernel or
     /// sandbox does not allow io_uring.
     Uring *uring();
+
+    /// True when the ring accepted a provided-buffer ring, so recv runs as
+    /// IORING_OP_RECV + IORING_RECV_MULTISHOT.
+    bool uring_multishot_available();
 #endif
 
 private:
@@ -145,6 +168,7 @@ namespace realurl
 {
 
 using detail::EventLoop;
+using detail::EventLoopStats;
 using detail::sync_wait;
 using detail::Task;
 

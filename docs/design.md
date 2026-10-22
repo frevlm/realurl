@@ -13,7 +13,7 @@ not on the request path.
 
 A `Client` and every connection it creates belong to one loop. Connections are
 never shared between loops; `SSL_CTX` (via `TlsContext`) is the only shared
-TLS object because BoringSSL guarantees its thread safety.
+TLS object because OpenSSL 3.x guarantees its thread safety.
 
 `ClientGroup` owns N loop/client pairs, one per worker thread. A task submitted
 with `spawn()`/`spawn_on()` runs on a worker loop, and `get()`/`request()`
@@ -126,21 +126,56 @@ selection when the attempt completes. Without this, a burst of N requests
 opened N connections. `Client::close()` (also run by the destructor) sends
 GOAWAY and shuts down every socket so peers observe EOF promptly.
 
+## Server runtime
+
+`realurl::Server` runs on the same EventLoop as the client. One thread owns one
+loop, one `SO_REUSEPORT` listener and one upstream `Client`; the raft of
+per-connection state (read buffer, H1 parser, H2 streams, HPACK, flow-control
+windows, timers) never leaves that thread.
+
+The connection dispatcher reads the first 24 bytes once. A client preface
+(`PRI * HTTP/2.0...`) selects `H2ServerConnection`; anything else is handed to
+`H1Connection` together with the bytes already read. TLS uses ALPN for the same
+choice.
+
+`H1Connection` keeps a stable header arena, parses with picohttpparser,
+supports keep-alive, pipelining, chunked bodies and `Expect: 100-continue`.
+`H2ServerConnection` reuses `FrameParser`/`FrameWriter`/HPACK and implements
+stream state, SETTINGS, per-stream and connection flow control, RST/GOAWAY and
+a round-robin writer. Both frontends share the router, `Request`/`Response` and
+the `StreamWriter` contract.
+
+`take_over_task()` is the native streaming path: the handler coroutine writes
+`StreamWriter` chunks and suspends when the client is slow. The legacy
+`take_over()`/`take_over_async()` adapters are kept for source compatibility
+and are not on the new path.
+
+`proxy_stream()` composes the downstream writer with a per-loop upstream
+`Client`: request bodies are streamed with `StreamedNative`, upstream DATA is
+forwarded as it arrives, and a suspended downstream write stops the upstream
+read loop. No bridge, post or thread hop is involved.
+
+Timers use an intrusive hashed wheel per loop. Coroutine framing and buffer
+ownership stay on the loop thread.
+
 ### io_uring (optional)
 
-`REALURL_WITH_IO_URING=ON` switches plaintext (h2c) connections to
+`REALURL_WITH_IO_URING=ON` switches plaintext (h2c) client connections to
 `UringTransport`, a completion-based transport on a per-loop raw io_uring ring
-(kernel UAPI, no liburing dependency). recv/send are submitted as SQEs and the
-loop is woken by an eventfd registered with the ring; completions are drained
-into the normal ready list. TLS stays on the readiness-based `TcpStream`
-because BoringSSL owns the fd. The backend is opt-in and Linux-only; the
-default build is unchanged.
+(kernel UAPI, no liburing dependency). recv uses `IORING_OP_RECV` with
+`IORING_RECV_MULTISHOT` and a registered provided-buffer ring (256 x 64 KiB);
+send is one SQE per write. Completions are drained from the CQ into the normal
+ready list, and the ring's eventfd wakes the loop. Kernels or sandboxes that
+reject the buffer ring fall back to one-shot recv; a loop without a usable ring
+falls back to the edge-triggered `TcpStream`. TLS stays on
+`TcpStream`/`TlsServerStream` because OpenSSL owns the fd. The backend is
+opt-in and Linux-only.
 
 ## What is deliberately absent
 
-HTTP/1.1 client fallback, HTTP/3, proxies, priority trees (parsed, ignored),
-server push (`ENABLE_PUSH=0`, PUSH_PROMISE is a connection error), trailers
-emission, and DNS beyond a thread-pool `getaddrinfo`. Each has a seam:
+HTTP/1.1 client fallback, HTTP/3, priority trees (parsed, ignored), server push
+(`ENABLE_PUSH=0`, PUSH_PROMISE is a connection error), trailers emission, and
+DNS beyond a thread-pool `getaddrinfo`. Each has a seam:
 `Transport` for socket backends, `Resolver` for name resolution,
 `ErrorCode`/`FrameType` for protocol versions. io_uring is available behind
 `REALURL_WITH_IO_URING` for h2c only.

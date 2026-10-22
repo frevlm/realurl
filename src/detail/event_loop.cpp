@@ -39,17 +39,11 @@ struct EventLoop::Impl {
         Slot write;
     };
 
-    struct Timer {
-        Clock::time_point when;
+    struct LegacyTimer {
+        TimerNode node;
         TimerId id = 0;
+        Impl *owner = nullptr;
         std::function<void()> fn;
-    };
-
-    struct TimerLater {
-        bool operator()(const Timer &a, const Timer &b) const
-        {
-            return a.when > b.when;
-        }
     };
 
     std::unique_ptr<Poller> poller = Poller::create();
@@ -61,13 +55,19 @@ struct EventLoop::Impl {
     std::vector<std::function<void()>> posts;
     std::vector<std::function<void()>> local_posts;
 
-    std::priority_queue<Timer, std::vector<Timer>, TimerLater> timers;
-    std::unordered_set<TimerId> active_timers;
+    TimerWheel wheel;
+    std::unordered_map<TimerId, std::unique_ptr<LegacyTimer>> legacy_timers;
     TimerId next_timer_id = 1;
 
     std::vector<std::coroutine_handle<>> ready;
     std::vector<std::coroutine_handle<>> batch;
     std::atomic<bool> stopped{ false };
+
+    std::atomic<std::uint64_t> stat_posts{ 0 };
+    std::atomic<std::uint64_t> stat_timer_callbacks{ 0 };
+    std::atomic<std::uint64_t> stat_io_events{ 0 };
+    std::atomic<std::uint64_t> stat_resumes{ 0 };
+    std::atomic<std::uint64_t> stat_poll_iterations{ 0 };
 
 #ifdef REALURL_WITH_IO_URING
     bool uring_attempted = false;
@@ -77,6 +77,20 @@ struct EventLoop::Impl {
     static std::uint32_t mask_of(const FdState &state)
     {
         return (state.read.callback ? kIoRead : 0U) | (state.write.callback ? kIoWrite : 0U);
+    }
+
+    static void fire_legacy(void *context)
+    {
+        auto *timer = static_cast<LegacyTimer *>(context);
+        Impl *impl = timer->owner;
+        const auto it = impl->legacy_timers.find(timer->id);
+        if (it == impl->legacy_timers.end())
+            return;
+
+        std::unique_ptr<LegacyTimer> holder = std::move(it->second);
+        impl->legacy_timers.erase(it);
+        if (holder->fn)
+            holder->fn();
     }
 };
 
@@ -123,18 +137,16 @@ bool EventLoop::run_once()
         fn();
     impl.local_posts.clear();
 
+    const std::uint64_t fired_before = impl.wheel.fired_total();
     const Clock::time_point now = Clock::now();
-    while (!impl.timers.empty() && impl.timers.top().when <= now) {
-        Impl::Timer timer = impl.timers.top();
-        impl.timers.pop();
-        if (impl.active_timers.erase(timer.id) > 0)
-            timer.fn();
-    }
+    impl.wheel.advance(now);
+    impl.stat_timer_callbacks.fetch_add(impl.wheel.fired_total() - fired_before,
+                                        std::memory_order_relaxed);
 
     int timeout_ms = 1000;
-    if (!impl.timers.empty()) {
+    if (const auto next = impl.wheel.next_deadline()) {
         const auto delta =
-            std::chrono::duration_cast<std::chrono::milliseconds>(impl.timers.top().when - Clock::now()).count();
+            std::chrono::duration_cast<std::chrono::milliseconds>(*next - Clock::now()).count();
         timeout_ms = delta < 0 ? 0 : static_cast<int>(std::min<long long>(delta, 1000));
     }
     if (!impl.ready.empty())
@@ -144,6 +156,9 @@ bool EventLoop::run_once()
         impl.poller->wait(impl.events, timeout_ms);
     else
         impl.events.clear();
+
+    impl.stat_poll_iterations.fetch_add(1, std::memory_order_relaxed);
+    impl.stat_io_events.fetch_add(impl.events.size(), std::memory_order_relaxed);
 
     for (const IoEvent &event : impl.events) {
         const auto it = impl.io.find(event.fd);
@@ -160,6 +175,7 @@ bool EventLoop::run_once()
 
     while (!impl.ready.empty()) {
         impl.batch.swap(impl.ready);
+        impl.stat_resumes.fetch_add(impl.batch.size(), std::memory_order_relaxed);
         for (std::coroutine_handle<> handle : impl.batch)
             handle.resume();
         impl.batch.clear();
@@ -185,21 +201,54 @@ void EventLoop::post(std::function<void()> fn)
         std::lock_guard<std::mutex> lock(impl_->post_mutex);
         impl_->posts.push_back(std::move(fn));
     }
+    impl_->stat_posts.fetch_add(1, std::memory_order_relaxed);
     impl_->poller->wakeup();
+}
+
+EventLoopStats EventLoop::stats() const noexcept
+{
+    EventLoopStats result;
+    result.posts = impl_->stat_posts.load(std::memory_order_relaxed);
+    result.timer_callbacks = impl_->stat_timer_callbacks.load(std::memory_order_relaxed);
+    result.io_events = impl_->stat_io_events.load(std::memory_order_relaxed);
+    result.resumes = impl_->stat_resumes.load(std::memory_order_relaxed);
+    result.poll_iterations = impl_->stat_poll_iterations.load(std::memory_order_relaxed);
+    return result;
+}
+
+void EventLoop::schedule(TimerNode &node, std::chrono::nanoseconds delay, void (*callback)(void *),
+                         void *context)
+{
+    impl_->wheel.schedule(node, delay, callback, context);
+}
+
+void EventLoop::cancel(TimerNode &node) noexcept
+{
+    impl_->wheel.cancel(node);
 }
 
 TimerId EventLoop::schedule(std::chrono::nanoseconds delay, std::function<void()> fn)
 {
-    const TimerId id = impl_->next_timer_id++;
-    impl_->active_timers.insert(id);
-    impl_->timers.push({ Clock::now() + delay, id, std::move(fn) });
-    return id;
+    auto entry = std::make_unique<Impl::LegacyTimer>();
+    entry->id = impl_->next_timer_id++;
+    entry->owner = impl_.get();
+    entry->fn = std::move(fn);
+
+    Impl::LegacyTimer *raw = entry.get();
+    impl_->legacy_timers.emplace(raw->id, std::move(entry));
+    impl_->wheel.schedule(raw->node, delay, &Impl::fire_legacy, raw);
+    return raw->id;
 }
 
 void EventLoop::cancel(TimerId id)
 {
-    if (id != 0)
-        impl_->active_timers.erase(id);
+    if (id == 0)
+        return;
+    const auto it = impl_->legacy_timers.find(id);
+    if (it == impl_->legacy_timers.end())
+        return;
+    impl_->wheel.cancel(it->second->node);
+    impl_->legacy_timers.erase(it);
 }
 
 void EventLoop::spawn(Task<void> &&task)
@@ -212,6 +261,12 @@ void EventLoop::spawn(Task<void> &&task)
 Task<void> EventLoop::sleep_for(std::chrono::nanoseconds delay)
 {
     struct SleepAwaiter {
+        static void on_timer(void *context)
+        {
+            auto *self = static_cast<SleepAwaiter *>(context);
+            self->loop_->resume_later(self->handle_);
+        }
+
         bool await_ready() const noexcept
         {
             return false;
@@ -220,22 +275,21 @@ Task<void> EventLoop::sleep_for(std::chrono::nanoseconds delay)
         void await_suspend(std::coroutine_handle<> handle)
         {
             handle_ = handle;
-            timer_ = loop_->schedule(delay_, [this] { loop_->resume_later(handle_); });
+            loop_->schedule(timer_, delay_, &SleepAwaiter::on_timer, this);
         }
 
         void await_resume() noexcept
         {
-            if (timer_ != 0)
-                loop_->cancel(timer_);
+            loop_->cancel(timer_);
         }
 
         EventLoop *loop_;
         std::chrono::nanoseconds delay_;
         std::coroutine_handle<> handle_{};
-        TimerId timer_ = 0;
+        TimerNode timer_;
     };
 
-    co_await SleepAwaiter{ this, delay };
+    co_await SleepAwaiter{ this, delay, {}, {} };
 }
 
 void EventLoop::add_io(int fd, std::uint32_t events, IoCallback callback, void *ctx)
@@ -291,6 +345,12 @@ void EventLoop::wakeup()
 }
 
 #ifdef REALURL_WITH_IO_URING
+bool EventLoop::uring_multishot_available()
+{
+    Uring *ring = uring();
+    return ring != nullptr && ring->pbuf_available();
+}
+
 Uring *EventLoop::uring()
 {
     if (!impl_->uring && !impl_->uring_attempted) {

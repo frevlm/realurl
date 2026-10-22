@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <utility>
@@ -82,8 +83,24 @@ private:
     IoWaiter *write_waiter_ = nullptr;
 };
 
+struct ListenerOptions {
+    /// Bind address. "*" or an empty string binds the wildcard address.
+    std::string host = "127.0.0.1";
+    std::uint16_t port = 0;
+    int backlog = 128;
+    /// Enable SO_REUSEPORT so every event-loop thread can bind the same port.
+    bool reuse_port = false;
+    /// Linux only: defer accept until the first payload byte arrives.
+    bool defer_accept = false;
+    /// Linux only: enable TCP Fast Open on the listener.
+    bool tcp_fastopen = false;
+    /// For an IPv6 wildcard bind, also accept IPv4-mapped connections.
+    bool dual_stack = true;
+};
+
 class TcpListener {
 public:
+    explicit TcpListener(EventLoop &loop, const ListenerOptions &options);
     TcpListener(EventLoop &loop, std::uint16_t port, int backlog = 128);
     ~TcpListener();
 
@@ -95,6 +112,11 @@ public:
     std::uint16_t port() const noexcept
     {
         return port_;
+    }
+
+    int family() const noexcept
+    {
+        return family_;
     }
 
     int fd() const noexcept
@@ -117,6 +139,7 @@ private:
     EventLoop *loop_ = nullptr;
     int fd_ = -1;
     std::uint16_t port_ = 0;
+    int family_ = AF_INET;
     IoWaiter *waiter_ = nullptr;
 };
 

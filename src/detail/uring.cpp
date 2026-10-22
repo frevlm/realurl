@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -147,11 +148,13 @@ Uring::Uring(EventLoop &loop)
         return;
     }
 
+    (void)setup_buffer_ring();
     loop_.add_io(event_fd_, kIoRead, &Uring::on_event, this);
 }
 
 Uring::~Uring()
 {
+    release_buffer_ring();
     if (event_fd_ >= 0) {
         loop_.del_io(event_fd_);
         ::close(event_fd_);
@@ -247,6 +250,122 @@ bool Uring::submit_send(int fd, std::string_view data, UringOp *op)
     return submit_one(sqe);
 }
 
+bool Uring::setup_buffer_ring()
+{
+    buf_ring_size_ = static_cast<std::size_t>(kBufCount) * sizeof(io_uring_buf);
+    buf_memory_size_ = static_cast<std::size_t>(kBufCount) * kBufSize;
+
+    buf_ring_ = static_cast<io_uring_buf *>(::mmap(nullptr, buf_ring_size_, PROT_READ | PROT_WRITE,
+                                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (buf_ring_ == reinterpret_cast<io_uring_buf *>(MAP_FAILED)) {
+        buf_ring_ = nullptr;
+        return false;
+    }
+    buf_memory_ = ::mmap(nullptr, buf_memory_size_, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf_memory_ == MAP_FAILED) {
+        buf_memory_ = nullptr;
+        release_buffer_ring();
+        return false;
+    }
+
+    buf_tail_ptr_ = reinterpret_cast<std::uint16_t *>(
+        reinterpret_cast<char *>(buf_ring_) + offsetof(io_uring_buf, resv));
+    for (std::uint32_t i = 0; i < kBufCount; ++i) {
+        io_uring_buf &buf = buf_ring_[i];
+        buf.addr = reinterpret_cast<__u64>(static_cast<char *>(buf_memory_) + i * kBufSize);
+        buf.len = kBufSize;
+        buf.bid = i;
+    }
+    buf_tail_ = kBufCount;
+    __atomic_store_n(buf_tail_ptr_, static_cast<std::uint16_t>(buf_tail_), __ATOMIC_RELEASE);
+
+    io_uring_buf_reg reg{};
+    reg.ring_addr = reinterpret_cast<__u64>(buf_ring_);
+    reg.ring_entries = kBufCount;
+    reg.bgid = kBufGroup;
+    if (::syscall(__NR_io_uring_register, ring_fd_, IORING_REGISTER_PBUF_RING, &reg, 1) < 0) {
+        release_buffer_ring();
+        return false;
+    }
+
+    pbuf_ = true;
+    return true;
+}
+
+void Uring::release_buffer_ring() noexcept
+{
+    if (pbuf_) {
+        io_uring_buf_reg reg{};
+        reg.bgid = kBufGroup;
+        (void)::syscall(__NR_io_uring_register, ring_fd_, IORING_UNREGISTER_PBUF_RING, &reg, 1);
+        pbuf_ = false;
+    }
+    if (buf_ring_ != nullptr) {
+        ::munmap(buf_ring_, buf_ring_size_);
+        buf_ring_ = nullptr;
+    }
+    if (buf_memory_ != nullptr) {
+        ::munmap(buf_memory_, buf_memory_size_);
+        buf_memory_ = nullptr;
+    }
+}
+
+void Uring::return_buffer(std::uint32_t bid) noexcept
+{
+    if (!pbuf_ || bid >= kBufCount || buf_ring_ == nullptr)
+        return;
+
+    const std::uint32_t index = buf_tail_ & (kBufCount - 1);
+    io_uring_buf &buf = buf_ring_[index];
+    buf.addr = reinterpret_cast<__u64>(static_cast<char *>(buf_memory_) + bid * kBufSize);
+    buf.len = kBufSize;
+    buf.bid = bid;
+    ++buf_tail_;
+    __atomic_store_n(buf_tail_ptr_, static_cast<std::uint16_t>(buf_tail_), __ATOMIC_RELEASE);
+}
+
+char *Uring::buffer_data(std::uint32_t bid) noexcept
+{
+    return static_cast<char *>(buf_memory_) + static_cast<std::size_t>(bid) * kBufSize;
+}
+
+bool Uring::submit_recv_multishot(int fd, UringOp *op)
+{
+    if (ring_fd_ < 0 || !pbuf_)
+        return false;
+
+    io_uring_sqe *sqe = get_sqe();
+    if (sqe == nullptr)
+        return false;
+
+    sqe->opcode = IORING_OP_RECV;
+    sqe->fd = fd;
+    sqe->addr = 0;
+    sqe->len = 0;
+    sqe->msg_flags = 0;
+    sqe->buf_group = kBufGroup;
+    sqe->flags = IOSQE_BUFFER_SELECT;
+    sqe->ioprio = IORING_RECV_MULTISHOT;
+    sqe->user_data = reinterpret_cast<__u64>(op);
+    return submit_one(sqe);
+}
+
+void Uring::cancel(int fd)
+{
+    if (ring_fd_ < 0 || fd < 0)
+        return;
+    io_uring_sqe *sqe = get_sqe();
+    if (sqe == nullptr)
+        return;
+    sqe->opcode = IORING_OP_ASYNC_CANCEL;
+    sqe->fd = -1;
+    sqe->addr = static_cast<__u64>(fd);
+    sqe->len = 0;
+    sqe->user_data = 0;
+    (void)submit_one(sqe);
+}
+
 void Uring::drain()
 {
     if (ring_fd_ < 0)
@@ -260,7 +379,7 @@ void Uring::drain()
             io_uring_cqe *cqe = &cqes_[head & *cq_ring_mask_];
             auto *op = reinterpret_cast<UringOp *>(cqe->user_data);
             if (op != nullptr)
-                op->complete(cqe->res);
+                op->complete(cqe->res, cqe->flags);
             ++head;
         }
         store_release(cq_head_, head);

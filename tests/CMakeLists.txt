@@ -7,7 +7,7 @@ endfunction()
 
 add_library(realurl_test_support STATIC support/h2_test_server.cpp)
 target_include_directories(realurl_test_support PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(realurl_test_support PUBLIC realurl::core ssl crypto realurl_warnings)
+target_link_libraries(realurl_test_support PUBLIC realurl::core OpenSSL::SSL OpenSSL::Crypto realurl_warnings)
 
 realurl_add_test(buffer_pool_test)
 realurl_add_test(body_feeder_test)
@@ -22,6 +22,7 @@ realurl_add_test(pump_pool_shrink_test)
 target_link_libraries(pump_pool_shrink_test PRIVATE realurl::server)
 realurl_add_test(fd_writer_test)
 realurl_add_test(event_loop_test)
+realurl_add_test(timer_wheel_test)
 realurl_add_test(socket_test)
 realurl_add_test(frame_test)
 realurl_add_test(hpack_test)
@@ -37,3 +38,22 @@ target_link_libraries(server_test PRIVATE realurl::server)
 
 realurl_add_test(asio_bridge_test)
 target_link_libraries(asio_bridge_test PRIVATE realurl::server realurl_test_support)
+
+realurl_add_test(proxy_test)
+target_link_libraries(proxy_test PRIVATE realurl::server realurl_test_support)
+
+realurl_add_test(h2_server_test)
+target_link_libraries(h2_server_test PRIVATE realurl::server realurl_test_support)
+
+realurl_add_test(tls_server_test)
+target_link_libraries(tls_server_test PRIVATE realurl::server realurl_test_support OpenSSL::SSL OpenSSL::Crypto)
+target_compile_definitions(tls_server_test PRIVATE REALURL_CERT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/certs")
+
+realurl_add_test(ktls_test)
+target_link_libraries(ktls_test PRIVATE realurl::core OpenSSL::SSL OpenSSL::Crypto)
+target_compile_definitions(ktls_test PRIVATE REALURL_CERT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/certs")
+
+if(REALURL_WITH_IO_URING)
+  realurl_add_test(uring_test)
+  target_compile_definitions(uring_test PRIVATE REALURL_WITH_IO_URING=1)
+endif()

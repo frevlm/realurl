@@ -2,6 +2,7 @@
 #include "support/h2_test_server.hpp"
 #include "realurl/asio_bridge.hpp"
 #include "realurl/http2.hpp"
+#include "realurl/proxy.hpp"
 #include "realurl/server.hpp"
 #include "realurl/stream_pump_pool.hpp"
 
@@ -272,6 +273,283 @@ int run_requests(int total, int concurrency, int connections = 1)
     std::printf("  rss: peak=%.1fMB current=%.1fMB\n", megabytes(bench::peak_rss_bytes()),
                 megabytes(bench::current_rss_bytes()));
     return 0;
+}
+
+
+int free_port();
+
+struct H2ServerBenchState
+{
+    realurl::ClientGroup *group = nullptr;
+    std::string url;
+    int total = 0;
+    std::atomic<int> *next = nullptr;
+    std::atomic<int> *done = nullptr;
+    std::atomic<int> *failures = nullptr;
+    std::vector<double> *latencies = nullptr;
+};
+
+realurl::Task<void> h2_server_bench_worker(H2ServerBenchState state)
+{
+    for (;;) {
+        const int index = state.next->fetch_add(1, std::memory_order_relaxed);
+        if (index >= state.total)
+            break;
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            const realurl::Response response = co_await state.group->get(state.url);
+            if (response.head.status != 200)
+                state.failures->fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+            state.failures->fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto end = std::chrono::steady_clock::now();
+        (*state.latencies)[static_cast<std::size_t>(index)] =
+            std::chrono::duration<double, std::milli>(end - start).count();
+        state.done->fetch_add(1, std::memory_order_acq_rel);
+    }
+    co_return;
+}
+
+int run_h2_server_unary(int total, int concurrency, int workers)
+{
+    total = std::max(1, total);
+    concurrency = std::max(1, concurrency);
+    workers = std::max(1, workers);
+
+    const int port = free_port();
+    if (port <= 0) {
+        std::fprintf(stderr, "h2_unary: cannot reserve a local port\n");
+        return 1;
+    }
+
+    realurl::Server server;
+    server.set_io_threads(1);
+    server.Get("/hello", [](const auto &, auto &response) { response.set_content("world"); });
+
+    std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
+    for (int i = 0; i < 1000 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(1ms);
+    if (!server.is_running()) {
+        server.stop();
+        listener.join();
+        std::fprintf(stderr, "h2_unary: server failed to start\n");
+        return 1;
+    }
+
+    realurl::Config config;
+    config.max_conns_per_origin = 1;
+    config.max_streams_per_conn = concurrency;
+    realurl::ClientGroup group(static_cast<unsigned>(workers), config);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/hello";
+
+    try {
+        (void)realurl::sync_wait(group.get(url));
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "h2_unary: warmup failed: %s\n", error.what());
+        server.stop();
+        listener.join();
+        return 1;
+    }
+
+    std::atomic<int> next{ 0 };
+    std::atomic<int> done{ 0 };
+    std::atomic<int> failures{ 0 };
+    std::vector<double> latencies(static_cast<std::size_t>(total));
+
+    const std::uint64_t rss_before = bench::current_rss_bytes();
+    const bench::CpuTime cpu_start = bench::cpu_time();
+    const auto wall_start = std::chrono::steady_clock::now();
+
+    H2ServerBenchState state{ &group, url, total, &next, &done, &failures, &latencies };
+    for (int i = 0; i < concurrency; ++i)
+        group.spawn(h2_server_bench_worker(state));
+
+    while (done.load(std::memory_order_acquire) < total)
+        std::this_thread::sleep_for(1ms);
+
+    const auto wall_end = std::chrono::steady_clock::now();
+    const bench::CpuTime cpu_end = bench::cpu_time();
+    const double wall = std::chrono::duration<double>(wall_end - wall_start).count();
+
+    const std::vector<double> pct = percentiles(latencies);
+    const int failed = failures.load(std::memory_order_relaxed);
+
+    std::printf("mode=h2_unary requests=%d concurrency=%d workers=%d\n", total, concurrency, workers);
+    std::printf("  status: %d ok, %d failed in %.2fs (%.0f req/s)\n", total - failed, failed, wall,
+                total / wall);
+    if (!pct.empty())
+        std::printf("  latency ms: p50=%.3f p90=%.3f p95=%.3f p99=%.3f p99.9=%.3f max=%.3f\n",
+                    pct[0], pct[1], pct[2], pct[3], pct[4], pct[5]);
+    const double cpu_total = cpu_end.total() - cpu_start.total();
+    std::printf("  cpu: user=%.2fs sys=%.2fs total=%.2fs (%.4f ms/req)\n",
+                cpu_end.user - cpu_start.user, cpu_end.system - cpu_start.system, cpu_total,
+                cpu_total * 1000.0 / total);
+    std::printf("  rss: before=%.1fMB peak=%.1fMB current=%.1fMB\n", megabytes(rss_before),
+                megabytes(bench::peak_rss_bytes()), megabytes(bench::current_rss_bytes()));
+
+    server.stop();
+    listener.join();
+    return failed == 0 ? 0 : 1;
+}
+
+
+struct H1BenchState
+{
+    int port = 0;
+    int total = 0;
+    std::atomic<int> *next = nullptr;
+    std::atomic<int> *failures = nullptr;
+    std::vector<double> *latencies = nullptr;
+};
+
+bool h1_read_response(int fd, std::string &buffer)
+{
+    for (;;) {
+        const auto header_end = buffer.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+            std::size_t length = 0;
+            const auto length_pos = buffer.find("Content-Length:");
+            if (length_pos != std::string::npos && length_pos < header_end) {
+                const std::size_t value_start = length_pos + 15;
+                const auto value_end = buffer.find("\r\n", value_start);
+                if (value_end != std::string::npos)
+                    length = static_cast<std::size_t>(std::atoi(buffer.substr(value_start, value_end - value_start).c_str()));
+            }
+            if (buffer.size() >= header_end + 4 + length) {
+                buffer.erase(0, header_end + 4 + length);
+                return true;
+            }
+        }
+
+        char temp[16384];
+        const ssize_t n = ::recv(fd, temp, sizeof(temp), 0);
+        if (n <= 0)
+            return false;
+        buffer.append(temp, static_cast<std::size_t>(n));
+    }
+}
+
+void h1_bench_worker(H1BenchState state)
+{
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<std::uint16_t>(state.port));
+    ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        state.failures->fetch_add(state.total, std::memory_order_relaxed);
+        return;
+    }
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+        ::close(fd);
+        state.failures->fetch_add(state.total, std::memory_order_relaxed);
+        return;
+    }
+
+    int one = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    timeval timeout{ 10, 0 };
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    static constexpr std::string_view request =
+        "GET /hello HTTP/1.1\r\nHost: bench\r\n\r\n";
+    std::string buffer;
+
+    for (;;) {
+        const int index = state.next->fetch_add(1, std::memory_order_relaxed);
+        if (index >= state.total)
+            break;
+
+        const auto start = std::chrono::steady_clock::now();
+        std::size_t sent = 0;
+        bool ok = true;
+        while (sent < request.size()) {
+            const ssize_t n = ::send(fd, request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
+            if (n <= 0) {
+                ok = false;
+                break;
+            }
+            sent += static_cast<std::size_t>(n);
+        }
+        if (!ok || !h1_read_response(fd, buffer)) {
+            state.failures->fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        const auto end = std::chrono::steady_clock::now();
+        (*state.latencies)[static_cast<std::size_t>(index)] =
+            std::chrono::duration<double, std::milli>(end - start).count();
+    }
+
+    ::close(fd);
+}
+
+int run_h1_server_unary(int total, int concurrency, int threads)
+{
+    total = std::max(1, total);
+    concurrency = std::max(1, concurrency);
+    threads = std::max(1, threads);
+
+    const int port = free_port();
+    if (port <= 0) {
+        std::fprintf(stderr, "h1_unary: cannot reserve a local port\n");
+        return 1;
+    }
+
+    realurl::Server server;
+    server.set_io_threads(std::max(1, threads));
+    server.Get("/hello", [](const auto &, auto &response) { response.set_content("world"); });
+
+    std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
+    for (int i = 0; i < 1000 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(1ms);
+    if (!server.is_running()) {
+        server.stop();
+        listener.join();
+        std::fprintf(stderr, "h1_unary: server failed to start\n");
+        return 1;
+    }
+
+    std::atomic<int> next{ 0 };
+    std::atomic<int> failures{ 0 };
+    std::vector<double> latencies(static_cast<std::size_t>(total));
+    H1BenchState state{ port, total, &next, &failures, &latencies };
+
+    const std::uint64_t rss_before = bench::current_rss_bytes();
+    const bench::CpuTime cpu_start = bench::cpu_time();
+    const auto wall_start = std::chrono::steady_clock::now();
+
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(threads));
+    for (int i = 0; i < threads; ++i)
+        workers.emplace_back([state] { h1_bench_worker(state); });
+    for (auto &worker : workers)
+        worker.join();
+
+    const auto wall_end = std::chrono::steady_clock::now();
+    const bench::CpuTime cpu_end = bench::cpu_time();
+    const double wall = std::chrono::duration<double>(wall_end - wall_start).count();
+
+    const std::vector<double> pct = percentiles(latencies);
+    const int failed = failures.load(std::memory_order_relaxed);
+    std::printf("mode=h1_unary requests=%d connections=%d\n", total, threads);
+    std::printf("  status: %d ok, %d failed in %.2fs (%.0f req/s)\n", total - failed, failed, wall,
+                total / wall);
+    if (!pct.empty())
+        std::printf("  latency ms: p50=%.3f p90=%.3f p95=%.3f p99=%.3f p99.9=%.3f max=%.3f\n",
+                    pct[0], pct[1], pct[2], pct[3], pct[4], pct[5]);
+    const double cpu_total = cpu_end.total() - cpu_start.total();
+    std::printf("  cpu: user=%.2fs sys=%.2fs total=%.2fs (%.4f ms/req)\n",
+                cpu_end.user - cpu_start.user, cpu_end.system - cpu_start.system, cpu_total,
+                cpu_total * 1000.0 / total);
+    std::printf("  rss: before=%.1fMB peak=%.1fMB current=%.1fMB\n", megabytes(rss_before),
+                megabytes(bench::peak_rss_bytes()), megabytes(bench::current_rss_bytes()));
+
+    server.stop();
+    listener.join();
+    return failed == 0 ? 0 : 1;
 }
 
 int run_hold(int stream_count)
@@ -1103,7 +1381,8 @@ int run_proxy(int concurrency, int chunks, int interval_ms, int timeout_ms, int 
 
 /// Proxy in front of a 20 s SSE-style upstream, with a 2 MB request body.
 /// Measures the buffered bridge against the direct-client llm baseline.
-int run_proxy_llm(int concurrency, int duration_s, int body_bytes, int workers, bool bridged)
+int run_proxy_llm(int concurrency, int duration_s, int body_bytes, int workers, bool bridged,
+                  bool inline_proxy = false)
 {
     concurrency = std::max(1, concurrency);
     duration_s = std::max(1, duration_s);
@@ -1149,12 +1428,25 @@ int run_proxy_llm(int concurrency, int duration_s, int body_bytes, int workers, 
     }
 
     realurl::Server server;
-    server.set_io_threads(2);
+    if (inline_proxy) {
+        server.set_io_threads(1);
+        server.set_upstream(config);
+    } else {
+        server.set_io_threads(2);
+    }
     server.set_read_header_timeout(0ms);
     server.set_client_write_timeout(std::chrono::seconds(duration_s + 60));
-    server.Post("/proxy", [&group, upstream_url, bridged](const realurl::Server::Request &request,
-                                                          realurl::Server::Response &response) {
+    auto proxy_handler = [&group, upstream_url, bridged, inline_proxy](
+                             const realurl::Server::Request &request,
+                             realurl::Server::Response &response) {
         std::string body = request.body;
+        if (inline_proxy) {
+            response.take_over_task([&request, upstream_url](realurl::server::StreamWriter &writer)
+                                        -> realurl::Task<void> {
+                co_await realurl::server::proxy_stream(*request.upstream, upstream_url, request, writer);
+            });
+            return;
+        }
         if (bridged) {
             response.take_over_async([&group, upstream_url, body = std::move(body)](
                                          realurl::AsyncClientWriter &writer) mutable -> net::awaitable<void> {
@@ -1200,7 +1492,14 @@ int run_proxy_llm(int concurrency, int duration_s, int body_bytes, int workers, 
                 co_return;
             co_await writer.write(upstream_response.body);
         });
-    });
+    };
+
+    if (inline_proxy) {
+        server.Post("/proxy", proxy_handler,
+                    { .body_mode = realurl::Server::BodyMode::StreamedNative });
+    } else {
+        server.Post("/proxy", proxy_handler);
+    }
 
     const std::uint64_t rss_before = bench::current_rss_bytes();
     std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
@@ -1240,8 +1539,8 @@ int run_proxy_llm(int concurrency, int duration_s, int body_bytes, int workers, 
     const std::vector<double> pct_total = percentiles(total_ms);
     const std::size_t expected_bytes = static_cast<std::size_t>(concurrency) * static_cast<std::size_t>(body_bytes);
 
-    std::printf("mode=proxy_llm bridge=%d concurrency=%d duration=%ds body=%d workers=%d\n", bridged ? 1 : 0,
-                concurrency, duration_s, body_bytes, workers);
+    std::printf("mode=proxy_llm bridge=%d inline=%d concurrency=%d duration=%ds body=%d workers=%d\n",
+                bridged ? 1 : 0, inline_proxy ? 1 : 0, concurrency, duration_s, body_bytes, workers);
     std::printf("  status: %d ok, %d failed in %.2fs", concurrency - failures, failures, wall);
     if (failures > 0)
         std::printf(" [connect=%d send=%d read=%d first: stage=%d errno=%d recv=%d]", state.connect_failures,
@@ -1282,6 +1581,18 @@ int main(int argc, char **argv)
         const int connections = argc > 5 ? std::atoi(argv[5]) : 1;
         return run_requests_mt(total, concurrency, workers, connections);
     }
+    if (mode == "h1_unary") {
+        const int total = argc > 2 ? std::atoi(argv[2]) : 100000;
+        const int concurrency = argc > 3 ? std::atoi(argv[3]) : 8;
+        const int threads = argc > 4 ? std::atoi(argv[4]) : concurrency;
+        return run_h1_server_unary(total, concurrency, threads);
+    }
+    if (mode == "h2_unary") {
+        const int total = argc > 2 ? std::atoi(argv[2]) : 20000;
+        const int concurrency = argc > 3 ? std::atoi(argv[3]) : 100;
+        const int workers = argc > 4 ? std::atoi(argv[4]) : 1;
+        return run_h2_server_unary(total, concurrency, workers);
+    }
     if (mode == "hold") {
         const int streams = argc > 2 ? std::atoi(argv[2]) : 1000;
         return run_hold(streams);
@@ -1318,14 +1629,21 @@ int main(int argc, char **argv)
         const bool bridged = argc > 6 ? std::string(argv[6]) != "block" : true;
         return run_proxy_llm(concurrency, duration_s, body_bytes, workers, bridged);
     }
+    if (mode == "proxy_inline") {
+        const int concurrency = argc > 2 ? std::atoi(argv[2]) : 100;
+        const int duration_s = argc > 3 ? std::atoi(argv[3]) : 20;
+        const int body_bytes = argc > 4 ? std::atoi(argv[4]) : 2 * 1024 * 1024;
+        return run_proxy_llm(concurrency, duration_s, body_bytes, 1, false, true);
+    }
 
     std::fprintf(stderr,
                  "usage: %s requests <N> <concurrency> [connections] | requests_mt <N> <concurrency> <workers> "
-                 "[connections] | hold <streams> | llm <total> <concurrency> [duration_s] [streaming] [connections] "
+                 "[connections] | h2_unary <N> <concurrency> <workers> | hold <streams> | llm <total> <concurrency> [duration_s] [streaming] [connections] "
                  "| pump <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| async <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| proxy <concurrency> [chunks] [interval_ms] [timeout_ms] [workers] [bridge|block] "
-                 "| proxy_llm <concurrency> [duration_s] [body_bytes] [workers] [bridge|block]\n",
+                 "| proxy_llm <concurrency> [duration_s] [body_bytes] [workers] [bridge|block] "
+                 "| proxy_inline <concurrency> [duration_s] [body_bytes]\n",
                  argv[0]);
     return 2;
 }

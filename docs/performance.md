@@ -7,6 +7,77 @@ the clocks, so percentiles reflect steady state. RSS/CPU include the in-tree
 test server that runs in the same process. The tables below the architecture
 pass are the original 0.3 baseline.
 
+## Single-runtime server (0.4)
+
+Measured on Apple M5 / macOS, loopback, Release build, OpenSSL 3.6.5. The
+client, upstream h2c test server and downstream server run in the same process,
+so CPU/RSS include all three. `proxy_inline` uses one loop, one per-loop
+upstream Client, and `BodyMode::StreamedNative` (2 MB request bodies are
+forwarded chunk by chunk, not buffered).
+
+### Inline proxy vs buffered bridge (2 MB POST + 20 s SSE)
+
+| Mode | Concurrency | TTFT p50 | Total p50 | CPU | Peak RSS |
+|---|---:|---:|---:|---:|---:|
+| inline proxy | 100 | **22.2 ms** | 20.25 s | 0.75 s | **34.6 MB** |
+| buffered bridge | 100 | 20,235.0 ms | 20.24 s | 1.51 s | 445.0 MB |
+| inline proxy | 1,000 | **248.8 ms** | 20.24 s | 9.73 s | 170.3 MB |
+
+- 1,000 concurrent streams uploaded 2,097,152,000 bytes (2 MB each) with
+  `received == expected` and zero failures.
+- TTFT includes the upstream 2 MB upload; the first response chunk is written
+  as soon as the upstream emits it. The buffered bridge waits for END_STREAM,
+  which is why its TTFT equals the full 20 s stream.
+- Streamed request bodies keep RSS bounded: 100 streams used 34.6 MB instead
+  of 445 MB for the buffered bridge; 1,000 streams peaked at 170 MB.
+
+### H2 downstream unary
+
+| Requests | Streams / connection | req/s | p50 | p99 | CPU/req | Peak RSS |
+|---:|---:|---:|---:|---:|---:|---:|
+| 20,000 | 100 | 354,659 | 0.268 ms | 0.544 ms | 2.8 µs | 15.3 MB |
+| 50,000 | 1,000 | **685,068** | 1.259 ms | 5.104 ms | 1.5 µs | 82.4 MB |
+
+One EventLoop and one downstream H2 connection; the client and server share the
+process. The 1,000-stream run completes in 0.07 s with zero failures.
+
+### H1 downstream keep-alive
+
+| Requests | Connections | req/s | p50 | p99 | CPU/req |
+|---:|---:|---:|---:|---:|---:|
+| 100,000 | 8 | 205,539 | 0.037 ms | 0.083 ms | 12.4 µs |
+| 200,000 | 32 | 208,773 | 0.148 ms | 0.305 ms | 13.0 µs |
+
+One server loop. CPU includes the in-process load generator. HTTP/1.1 pays a
+recv, a parse and a send per request; H2 multiplexing is the scaling path.
+
+### Linux validation
+
+Ubuntu 24.04 container, 2 cores / 3 GB, clang 18.1.3, OpenSSL 3.0.13,
+`REALURL_WITH_IO_URING=ON`:
+
+- 22/22 tests pass, including `h2_server_test`, `proxy_test`,
+  `tls_server_test`, `ktls_test` and `uring_test`.
+- `uring: available=1 multishot=1`: the provided-buffer ring registered and
+  `IORING_OP_RECV + IORING_RECV_MULTISHOT` is active. This requires
+  `--security-opt seccomp=unconfined`; Docker's default seccomp profile blocks
+  `io_uring_setup`, in which case the readiness fallback runs and all tests
+  still pass.
+- kTLS: `SSL_OP_ENABLE_KTLS` is requested, but the linuxkit kernel used by
+  Docker Desktop has no TLS ULP (`/proc/net/tls_stat` is absent), so
+  `BIO_get_ktls_send/recv` are 0 and the connection correctly falls back to
+  user-space TLS. A bare-metal kernel with kTLS is required to measure the
+  offload.
+
+### io_uring
+
+`REALURL_WITH_IO_URING=ON` builds the completion transport (raw kernel UAPI,
+no liburing). Plaintext recv uses `IORING_OP_RECV` with
+`IORING_RECV_MULTISHOT` and a registered provided-buffer ring (256 x 64 KiB);
+send remains one SQE per batch. Kernels or sandboxes that reject the buffer
+ring fall back to one-shot recv, and a loop with no usable ring falls back to
+the edge-triggered `TcpStream` path.
+
 ## Current architecture pass
 
 Measured on the same machine before and after the persistent-poll, frame-pool
@@ -31,14 +102,10 @@ per-connection thread, and the host has 4 performance + 6 efficiency cores.
 Treat `requests_mt` as a client-scaling check, not a server benchmark; use an
 external load peer for absolute multi-loop numbers.
 
-### io_uring
+### io_uring (0.3 baseline)
 
-`REALURL_WITH_IO_URING=ON` builds the completion transport (raw kernel UAPI,
-no liburing). It is functionally verified on Linux with Clang 18: all 12 tests
-pass, and `client_test`/`client_group_test` drive h2c through ring recv/send.
-It stays opt-in because it is Linux-only and because one-shot recv/send still
-costs one `io_uring_enter` per operation; batching or multishot is the next
-step before claiming a throughput win.
+The 0.3 one-shot transport is still available as a fallback; the 0.4
+multishot/provided-buffer path is described above.
 
 ### Stream pump scaling (`pump`)
 

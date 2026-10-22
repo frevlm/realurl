@@ -17,24 +17,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libboost-dev clang-18 libstdc++-14-dev
+          sudo apt-get install -y ninja-build libboost-dev libssl-dev clang-18 libstdc++-14-dev
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja boost
+        run: brew install ninja boost openssl@3
 
       - name: Configure
         env:
           CXX: ${{ runner.os == 'Linux' && 'clang++-18' || 'clang++' }}
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ${{ runner.os == 'Linux' && '-DREALURL_WITH_IO_URING=ON' || '' }}
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            ${{ runner.os == 'Linux' && '-DREALURL_WITH_IO_URING=ON' || '-DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3' }}
 
       - name: Build
         run: cmake --build build

@@ -107,5 +107,35 @@ int main()
         CHECK(resolved);
     }
 
+    {
+        EventLoop loop;
+        ListenerOptions options;
+        options.host = "127.0.0.1";
+        options.port = 0;
+        options.reuse_port = true;
+
+        TcpListener first(loop, options);
+        CHECK(first.port() != 0);
+        CHECK(first.family() == AF_INET);
+
+        options.port = first.port();
+        TcpListener second(loop, options);
+        CHECK(second.port() == first.port());
+    }
+
+    {
+        EventLoop loop;
+        ListenerOptions options;
+        options.host = "::1";
+        options.port = 0;
+        try {
+            TcpListener listener(loop, options);
+            CHECK(listener.family() == AF_INET6);
+            CHECK(listener.port() != 0);
+        } catch (const std::exception &) {
+            // IPv6 may be unavailable in constrained containers.
+        }
+    }
+
     return test::summary();
 }

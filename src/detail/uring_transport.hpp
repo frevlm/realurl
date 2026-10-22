@@ -1,11 +1,11 @@
 #pragma once
 
-/// Completion-based TCP transport for h2c on Linux. TLS stays on the
-/// readiness-based TcpStream/TlsStream path because BoringSSL owns the fd.
+/// Completion-based TCP transport for h2c on Linux.
 ///
-/// The fd is switched to blocking mode and every recv/send is submitted to the
-/// loop's io_uring with IOSQE_ASYNC; completions wake the loop through the
-/// ring's eventfd registered with the poller.
+/// Recv uses IORING_OP_RECV + IORING_RECV_MULTISHOT with a provided-buffer
+/// ring when the kernel supports it; otherwise it falls back to one-shot recv.
+/// Send remains one SQE per write. TLS stays on the readiness-based
+/// TcpStream/TlsServerStream path.
 
 #ifdef REALURL_WITH_IO_URING
 
@@ -19,6 +19,8 @@
 
 namespace realurl::detail
 {
+
+struct RecvState;
 
 class UringTransport final : public Transport {
 public:
@@ -39,11 +41,12 @@ public:
     void close() noexcept override;
 
 private:
-    UringTransport(EventLoop &loop, Uring &ring, int fd) noexcept;
+    UringTransport(Uring &ring, int fd) noexcept;
 
-    EventLoop &loop_;
     Uring &ring_;
     int fd_ = -1;
+    std::shared_ptr<RecvState> recv_;
+    bool multishot_ = false;
 };
 
 } // namespace realurl::detail

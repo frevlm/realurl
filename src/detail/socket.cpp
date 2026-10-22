@@ -2,9 +2,12 @@
 
 #include <cerrno>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <system_error>
 
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
@@ -37,6 +40,100 @@ int accept_nonblocking(int fd, sockaddr *address, socklen_t *length)
     }
     return client;
 #endif
+}
+
+int bind_listener(const ListenerOptions &options, std::uint16_t &port, int &family)
+{
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_PASSIVE;
+
+    const bool wildcard = options.host.empty() || options.host == "*";
+    const std::string service = std::to_string(options.port);
+
+    addrinfo *results = nullptr;
+    const int rc = ::getaddrinfo(wildcard ? nullptr : options.host.c_str(), service.c_str(), &hints, &results);
+    if (rc != 0)
+        throw std::runtime_error(std::string("getaddrinfo: ") + ::gai_strerror(rc));
+
+    int last_error = 0;
+    int listener = -1;
+    for (addrinfo *entry = results; entry != nullptr; entry = entry->ai_next) {
+        const int fd = ::socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        if (fd < 0) {
+            last_error = errno;
+            continue;
+        }
+
+        set_nonblocking(fd);
+        set_cloexec(fd);
+
+        int reuse = 1;
+        (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+#ifdef SO_REUSEPORT
+        if (options.reuse_port) {
+            if (::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) != 0) {
+                last_error = errno;
+                ::close(fd);
+                continue;
+            }
+        }
+#endif
+
+        if (entry->ai_family == AF_INET6) {
+            const int v6only = options.dual_stack ? 0 : 1;
+            (void)::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        }
+
+#ifdef __linux__
+        if (options.defer_accept) {
+#ifdef TCP_DEFER_ACCEPT
+            (void)::setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &reuse, sizeof(reuse));
+#endif
+        }
+        if (options.tcp_fastopen) {
+#ifdef TCP_FASTOPEN
+            const int qlen = options.backlog;
+            (void)::setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen));
+#endif
+        }
+#endif
+
+        if (::bind(fd, entry->ai_addr, static_cast<socklen_t>(entry->ai_addrlen)) != 0) {
+            last_error = errno;
+            ::close(fd);
+            continue;
+        }
+        if (::listen(fd, options.backlog) != 0) {
+            last_error = errno;
+            ::close(fd);
+            continue;
+        }
+
+        sockaddr_storage bound{};
+        socklen_t bound_length = sizeof(bound);
+        if (::getsockname(fd, reinterpret_cast<sockaddr *>(&bound), &bound_length) == 0) {
+            port = bound.ss_family == AF_INET6
+                ? ntohs(reinterpret_cast<sockaddr_in6 *>(&bound)->sin6_port)
+                : ntohs(reinterpret_cast<sockaddr_in *>(&bound)->sin_port);
+        } else {
+            port = options.port;
+        }
+        family = entry->ai_family;
+        listener = fd;
+        break;
+    }
+
+    ::freeaddrinfo(results);
+
+    if (listener < 0) {
+        throw std::system_error(last_error != 0 ? last_error : EADDRNOTAVAIL, std::generic_category(),
+                                "bind");
+    }
+    return listener;
 }
 
 } // namespace
@@ -72,8 +169,12 @@ public:
             stream_->stop_wait(events_, this);
         else
             listener_->stop_wait(this);
-        if (timer_ != 0)
-            loop_->cancel(timer_);
+        loop_->cancel(timer_);
+    }
+
+    static void on_timeout(void *context)
+    {
+        static_cast<IoWaiter *>(context)->complete(0, ETIMEDOUT);
     }
 
     bool await_ready() const noexcept
@@ -85,7 +186,7 @@ public:
     {
         handle_ = handle;
         if (timeout_.count() > 0)
-            timer_ = loop_->schedule(timeout_, [this] { complete(0, ETIMEDOUT); });
+            loop_->schedule(timer_, timeout_, &IoWaiter::on_timeout, this);
         if (kind_ == Kind::Stream)
             stream_->start_wait(events_, this);
         else
@@ -110,10 +211,7 @@ public:
             stream_->stop_wait(events_, this);
         else
             listener_->stop_wait(this);
-        if (timer_ != 0) {
-            loop_->cancel(timer_);
-            timer_ = 0;
-        }
+        loop_->cancel(timer_);
         loop_->resume_later(handle_);
     }
 
@@ -127,7 +225,7 @@ private:
     std::uint32_t events_;
     std::chrono::milliseconds timeout_;
     std::coroutine_handle<> handle_{};
-    TimerId timer_ = 0;
+    TimerNode timer_;
     std::uint32_t revents_ = 0;
     int error_ = 0;
     bool done_ = false;
@@ -347,41 +445,16 @@ Task<TcpStream> TcpStream::connect(EventLoop &loop, const sockaddr *address, soc
     co_return stream;
 }
 
-TcpListener::TcpListener(EventLoop &loop, std::uint16_t port, int backlog)
+TcpListener::TcpListener(EventLoop &loop, const ListenerOptions &options)
     : loop_(&loop)
 {
-    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd_ < 0)
-        throw_errno("socket");
-
-    set_nonblocking(fd_);
-    set_cloexec(fd_);
-
-    int reuse = 1;
-    (void)::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = htons(port);
-    if (::bind(fd_, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
-        const int error = errno;
-        ::close(fd_);
-        fd_ = -1;
-        throw std::system_error(error, std::generic_category(), "bind");
-    }
-    if (::listen(fd_, backlog) != 0) {
-        const int error = errno;
-        ::close(fd_);
-        fd_ = -1;
-        throw std::system_error(error, std::generic_category(), "listen");
-    }
-
-    socklen_t length = sizeof(address);
-    if (::getsockname(fd_, reinterpret_cast<sockaddr *>(&address), &length) == 0)
-        port_ = ntohs(address.sin_port);
-
+    fd_ = bind_listener(options, port_, family_);
     register_io();
+}
+
+TcpListener::TcpListener(EventLoop &loop, std::uint16_t port, int backlog)
+    : TcpListener(loop, ListenerOptions{ "127.0.0.1", port, backlog })
+{
 }
 
 TcpListener::~TcpListener()

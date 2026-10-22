@@ -1,8 +1,13 @@
 # Server
 
-`realurl::Server` is a small HTTP/1.1 server with an httplib-like routing API.
-It exists so the HTTP entry point can live in realurl while the application
-keeps only route handlers.
+`realurl::Server` is an HTTP/1.1 and HTTP/2 server built on the realurl
+EventLoop. One event loop runs per io thread; each loop owns its listener
+(`SO_REUSEPORT`), connections, stream queues and upstream client. Handlers are
+coroutines, and a takeover handler can stream a response without crossing a
+thread or a second scheduler.
+
+The public routing API stays close to the 0.3 Beast server; the native streaming
+entry point is `Response::take_over_task()`.
 
 ## Quick start
 
@@ -10,6 +15,7 @@ keeps only route handlers.
 #include <realurl/server.hpp>
 
 realurl::Server server;
+server.set_io_threads(4);          // 4 event loops / SO_REUSEPORT listeners
 
 server.Get("/hello", [](const auto &, auto &res) {
     res.set_content("world", "text/plain");
@@ -20,55 +26,85 @@ server.Post("/echo", [](const auto &req, auto &res) {
 });
 
 server.Get("/events", [](const auto &, auto &res) {
-    res.take_over([](realurl::ClientWriter &writer) {
-        (void)writer("HTTP/1.1 200 OK\r\n"
-                     "Content-Type: text/event-stream\r\n"
-                     "Connection: close\r\n\r\n");
-        (void)writer("data: one\n\n");
+    res.take_over_task([](realurl::server::StreamWriter &writer) -> realurl::Task<void> {
+        const realurl::server::Header headers[] = {
+            { "content-type", "text/event-stream" },
+        };
+        co_await writer.write_head(200, headers, std::nullopt); // chunked H1 / DATA H2
+        co_await writer.write("data: one\n\n");
+        co_await writer.end();
     });
 });
 
-if (port == 0) { /* ... */ }
 server.listen("0.0.0.0", 8080); // blocks until stop()
 ```
 
-`stop()` may be called from another thread. It closes the acceptor, waits up to
-30 seconds for active connections, then stops the io threads.
+`stop()` closes the listeners, waits up to 2 seconds for active connections,
+then stops the loops. The request/response types are in
+`include/realurl/server_types.hpp`.
 
-## Routing
+## Routing and requests
 
 | API | Match |
 | --- | --- |
-| `Get/Post/Put/Delete(pattern, handler)` | exact path, or `:name` segments such as `/users/:id` |
-| `GetRegex/PostRegex/PutRegex/DeleteRegex(pattern, handler)` | `std::regex_match` on the path |
-| `set_pre_routing_handler(handler)` | runs before routing; return `Handled` to short-circuit |
+| `Get/Post/Put/Delete(pattern, handler)` | exact path, or `:name` segments (`/users/:id`) |
+| `GetRegex/...` | `std::regex_match` on the decoded path |
+| `set_pre_routing_handler(handler)` | before routing; return `Handled` to short-circuit |
 
-Match precedence is exact, then `:param`, then regex. `HEAD` falls back to a
-`GET` route and suppresses the body. Unknown paths return 404 with the body
-registered by `set_error_body(404, ...)`.
+Precedence is exact, then `:param`, then regex. `HEAD` falls back to a `GET`
+route and suppresses the body. Unknown paths return 404 with the body from
+`set_error_body(404, ...)`.
 
-`Request::path` has the query removed. Percent decoding is enabled by default
-(`set_path_decoding(false)` keeps the raw path, which streaming proxies that
-care about `%2F` should use).
+`Request` header/path fields are `std::string_view` views into the connection's
+head buffer. They stay valid until the handler (including a
+`take_over_task`) returns; copy anything that must outlive the request.
+
+```cpp
+struct Request {
+    std::string_view method, target, path, version;
+    std::span<const server::Header> headers;
+    std::unordered_map<std::string_view, std::string_view> path_params;
+    std::string body;                  // Buffered
+    BodyReader *body_reader;           // StreamedNative
+    std::shared_ptr<BodySource> body_source; // Streamed (legacy)
+    BodyMode body_mode;
+    long long content_length;
+    std::string_view remote_addr;
+    int remote_port;
+    EventLoop *loop;
+    Client *upstream;                  // set_upstream()
+    std::string_view get_header(std::string_view) const;
+    bool has_header(std::string_view) const;
+    Task<std::size_t> read_body(std::span<char>) const; // 0 = EOF
+};
+```
+
+`path` has the query removed. Percent decoding is enabled by default
+(`set_path_decoding(false)` preserves raw escapes).
 
 ## Body modes
 
-The body mode is a property of the route, decided before any body bytes are
-read:
+The body mode is a property of the route, decided before body bytes are read:
 
 ```cpp
-server.Post("/api/login", handler); // Buffered (default)
-server.Post("/v1/chat/completions", handler,
-            { .body_mode = realurl::Server::BodyMode::Streamed });
+server.Post("/login", handler);                       // Buffered (default)
+server.Post("/upload", handler,
+            { .body_mode = realurl::Server::BodyMode::StreamedNative });
 ```
 
-- **Buffered**: `Request::body` contains the whole body. Chunked request bodies
-  are decoded. This is the management/JSON mode.
-- **Streamed**: `Request::body_source` is a `BodySource`; `Request::body` is
-  empty. The server starts a `BodyFeeder` over the client socket, so memory is
-  bounded by the feeder window. A `Content-Length` is required; chunked bodies
-  are rejected with 400. Handlers must consume at most
-  `Request::content_length` bytes.
+- **Buffered**: `Request::body` holds the whole body. Chunked bodies are
+  decoded. Use this for management JSON and small unary requests.
+- **StreamedNative**: `Request::body_reader` is a coroutine `BodyReader`;
+  call `co_await req.read_body(buffer)` to pull chunks. Memory is bounded by the
+  reader window and the downstream flow-control window. This is the path for
+  proxy uploads and large bodies.
+- **Streamed**: compatibility shim for the 0.3 `BodySource` API. The body is
+  buffered and exposed through `Request::body_source`; new code should use
+  `StreamedNative`.
+
+`Expect: 100-continue` is honored after routing and the payload limit are known.
+`Content-Length` is required for `Streamed`; chunked is accepted by
+`Buffered`/`StreamedNative`.
 
 ## Responses
 
@@ -80,171 +116,120 @@ res.set_header("X-Request-Id", id);
 res.set_content(body, "application/json; charset=utf-8");
 ```
 
-Raw streaming response:
+`set_content(std::string_view)` stores a view and is zero-copy; the storage must
+outlive the response write. Use `set_content(std::string)` for owned bodies.
+
+Native streaming:
 
 ```cpp
-res.take_over([request = std::move(request)](realurl::ClientWriter &writer) {
-    // The task runs on a pump-pool thread. Write the head and body yourself.
-    if (!writer("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-                "Connection: close\r\n\r\n"))
-        return;
-    // ... pump events ...
+res.take_over_task([](realurl::server::StreamWriter &writer) -> realurl::Task<void> {
+    const realurl::server::Header headers[] = { { "content-type", "text/plain" } };
+    co_await writer.write_head(200, headers, std::nullopt);
+    co_await writer.write("one");
+    co_await writer.write("two");
+    co_await writer.end();
 });
 ```
 
-The handler returns immediately; the connection coroutine waits for the pump
-task to finish. `Response::status` is used for access logging and for the
-generated 413 when the body limit was exceeded before any byte was written.
-The task must not outlive its invocation; the `ClientWriter` is a reference
-into the connection frame. This path uses one pump thread per active stream,
-so it is bounded by the pump capacity and queue.
+`StreamWriter` methods:
 
-Async takeover, for thousands of concurrent streams:
+| Method | Meaning |
+| --- | --- |
+| `write_head(status, headers, content_length)` | Send the response head. Without `content_length`, HTTP/1.1 uses chunked and HTTP/2 omits it. |
+| `write(string_view)` | Queue body bytes; returns false when the client is gone. |
+| `end()` | Finish the body (chunk terminator / END_STREAM). |
+| `cancel()` | Abort the stream (H1 close, H2 RST_STREAM). |
+| `closed()` | True once the client or connection is gone. |
 
-```cpp
-res.take_over_async([](realurl::AsyncClientWriter &writer)
-    -> boost::asio::awaitable<void> {
-    if (!(co_await writer.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-                                "Connection: close\r\n\r\n")))
-        co_return;
-    co_await writer.write("data: one\n\n");
-});
-```
+HTTP/1.1 responses use `Content-Length` when known, otherwise chunked. HTTP/2
+responses use HEADERS + DATA; one stream never blocks another.
 
-The handler is a Boost.Asio coroutine on an io thread. `write()` suspends it
-until the socket accepts the bytes and returns false on disconnect or the
-client write timeout, so one io thread can drive many streams. The handler must
-not block; use asio timers/sockets or post work to another executor. This path
-does not consume a pump thread and is not limited by the pump capacity or
-queue; concurrency is bounded by io threads, fds, and memory. The buffer passed
-to `write()` must stay alive until the awaitable completes.
+### Legacy takeover
 
-There is intentionally no `set_chunked_content_provider`. Streaming responses
-use raw takeover so the application controls the exact wire bytes.
+`take_over()` (blocking pump thread) and `take_over_async()` (Boost.Asio
+awaitable) are kept for source compatibility and run through a bounded compat
+path. They are not used by the native server path. Over TLS both return 501;
+use `take_over_task()` instead. `set_pump_threads/queue_limit/idle_timeout`
+still configure the legacy path.
 
-### Upstream requests from an async takeover
+## Keep-alive, limits and errors
 
-`take_over_async` handlers run on an io thread and must not block. Use
-`realurl::async_request()` from `<realurl/asio_bridge.hpp>` to call the
-HTTP/2 client without blocking that thread:
-
-```cpp
-#include <realurl/asio_bridge.hpp>
-
-realurl::ClientGroup upstream(2);
-
-res.take_over_async([&upstream](realurl::AsyncClientWriter &writer)
-    -> boost::asio::awaitable<void> {
-    realurl::Response upstream_response;
-    bool failed = false;
-    try {
-        upstream_response =
-            co_await realurl::async_request(upstream, "GET", "http://127.0.0.1:8080/v1/chat");
-    } catch (...) {
-        failed = true;
-    }
-    if (failed) {
-        co_await writer.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
-        co_return;
-    }
-    const std::string head = "HTTP/1.1 200 OK\r\nContent-Length: " +
-        std::to_string(upstream_response.body.size()) + "\r\n\r\n";
-    if (!(co_await writer.write(head)))
-        co_return;
-    co_await writer.write(upstream_response.body);
-});
-```
-
-The request runs on one of the group's EventLoop workers; the result is posted
-back to the handler's executor, so the io thread is free while the upstream is
-in flight. One worker multiplexes every stream over its pooled h2 connection;
-raise `Config::max_streams_per_conn` when you expect thousands of concurrent
-upstream streams. The `ClientGroup` must outlive the operation. The bridge
-buffers the upstream response before completing; it does not relay chunks as
-they arrive, and cancellation of the waiting handler is not propagated
-upstream.
-
-The completion-token form is available for callbacks and futures:
-`async_request(group, method, url, headers, body, timeout, token)` completes as
-`void(std::exception_ptr, Response)`. With `boost::asio::use_awaitable` the
-exception is rethrown at the `co_await` site.
-
-## Limits and errors
+HTTP/1.1 keep-alive is on by default (`set_keep_alive(false)` for the old
+one-request-per-connection behavior). A response with `Connection: close` or an
+HTTP/1.0 request without `keep-alive` closes the connection. Pipelined requests
+are parsed from the same buffer, up to 16 outstanding.
 
 | Setting | Default | Behavior |
 | --- | --- | --- |
-| `set_payload_max_length(n)` | 0 (unlimited) | Buffered: 413 during parse. Streamed: 413 before the handler or after the task if nothing was written. |
+| `set_payload_max_length(n)` | 0 (unlimited) | 413 before or during the body read |
 | `set_header_limit(n)` | 1 MiB | 431 |
-| `set_error_body(status, type, body)` | empty | Body used for generated 400/404/413/431/500/503 responses |
-| `set_read_header_timeout(ms)` | 5 s | 0 disables |
-| `set_client_write_timeout(ms)` | 60 s | Used by `take_over` writers |
-| `set_io_threads(n)` | hardware concurrency | 0 selects the default |
-| `set_pump_threads(n)` | automatic | Ceiling on `take_over` workers; 0 selects the automatic value. Workers start at `min(capacity, CPUs)` and grow on demand. `REALURL_PUMP_THREADS` sets the same ceiling. Must be called before the first streaming response. |
-| `set_pump_queue_limit(n)` | fd-budget remainder, capped at capacity | Maximum `take_over` tasks waiting for a worker; 0 selects the automatic value. When the queue is full, new streaming requests get 503 + `Retry-After: 1`. `REALURL_PUMP_QUEUE` sets the same limit. Must be called before the first streaming response. |
-| `set_pump_idle_timeout(ms)` | 60 s | Workers above the initial size exit after this idle time; 0 disables shrinking. `REALURL_PUMP_IDLE_MS` sets the same value. Must be called before the first streaming response. |
+| `set_error_body(status, type, body)` | empty | Generated 400/404/408/413/431/500/503 body |
+| `set_read_header_timeout(ms)` | 5 s | Header wait; 0 disables |
+| `set_request_idle_timeout(ms)` | 60 s | Idle wait between body chunks |
+| `set_client_write_timeout(ms)` | 60 s | Per-write wait; not a total stream deadline |
+| `set_io_threads(n)` | hardware concurrency | Number of EventLoop/listener threads |
+| `set_max_connections(n)` | 0 (unlimited) | Per loop |
+| `set_queue_watermark(high, low)` | 64 KiB / 32 KiB | Per-stream output queue |
+| `set_strategy(...)` | Auto | `Latency`, `Throughput`, `Bandwidth`, `Tunnel` |
+| `set_keep_alive(bool)` | true | HTTP/1.1 connection reuse |
 
-Every response carries `Connection: close`; the server handles one request per
-connection. The status line always uses the canonical reason phrase.
+Errors use the canonical reason phrase and `Connection: close`. A header/body
+read timeout is 408. A handler exception before any response byte is 500.
+
+## In-loop upstream proxy
+
+```cpp
+realurl::Config upstream;
+upstream.max_conns_per_origin = 1;
+upstream.max_streams_per_conn = 1000;
+server.set_upstream(upstream);   // one Client per loop
+
+server.Post("/v1/chat", [url](const realurl::Server::Request &req,
+                              realurl::Server::Response &res) {
+    res.take_over_task([&req, url](realurl::server::StreamWriter &out)
+                           -> realurl::Task<void> {
+        co_await realurl::server::proxy_stream(*req.upstream, url, req, out);
+    });
+}, { .body_mode = realurl::Server::BodyMode::StreamedNative });
+```
+
+`proxy_stream()`:
+
+- forwards request headers (hop-by-hop removed) and streams the request body;
+- waits for upstream HEADERS, writes the downstream head with the same status;
+- reads upstream DATA and writes each chunk downstream, then ends the stream;
+- returns 502 only before the downstream head; after it, the stream is closed;
+- cancels the upstream H2 stream when the downstream writer fails.
+
+The upstream `Client` and downstream connection are on the same EventLoop. A
+slow downstream makes `writer.write()` suspend, which stops the upstream read
+loop and closes the H2 flow-control window; no bridge or thread hop is involved.
+
+## HTTP/2 downstream
+
+Plaintext h2c uses the client preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) to
+select the H2 frontend; anything else goes to HTTP/1.1. TLS uses ALPN (`h2` or
+`http/1.1`). H2 supports SETTINGS/ACK, HEADERS/CONTINUATION, DATA, WINDOW_UPDATE,
+RST_STREAM, PING, GOAWAY, trailers and `MAX_CONCURRENT_STREAMS`; inbound and
+outbound flow control are tracked per stream and per connection. The H2 writer
+round-robins streams so one slow stream cannot exhaust the shared connection
+window.
+
+## TLS and kTLS
+
+```cpp
+server.set_tls("cert.pem", "key.pem");
+server.set_ktls(true);   // Linux best-effort
+```
+
+OpenSSL 3.x performs the handshake (TLS 1.2/1.3, ALPN, session tickets). On
+Linux the context sets `SSL_OP_ENABLE_KTLS`; `TlsServerStream` reports whether
+the kernel took over TX/RX via `BIO_get_ktls_send/recv`. If the kernel/cipher
+does not support kTLS, the connection falls back to user-space TLS. TLS
+takeover must use `take_over_task()`; the legacy fd writer cannot speak TLS.
 
 ## In-memory dispatch
 
-`Server::process(raw_request)` parses one request and returns the raw response
-bytes without opening a socket or starting worker threads. Buffered routes and
-`take_over` are both supported; `take_over` writes into the returned string.
-This is the replacement for httplib's in-memory `Server::process` in tests.
-
-```cpp
-const std::string response =
-    server.process("GET /hello HTTP/1.1\r\nHost: test\r\n\r\n");
-```
-
-An empty return value means parsing failed; callers usually map that to 400.
-
-## Threading
-
-| Thread | Work |
-| --- | --- |
-| io threads | accept, header/body read, routing, buffered handlers, response writes |
-| feeder thread (one per Streamed request) | reads the client body into the bounded window |
-| pump threads | blocking `take_over` tasks |
-| io threads | `take_over_async` coroutines (no pump worker) |
-| ClientGroup worker threads (application-owned) | upstream requests issued through `realurl::async_request` |
-
-Buffered handlers run on an io thread, so long blocking work blocks one io
-thread. Streamed handlers should return quickly and put the real work in
-`take_over`.
-
-A `take_over` task blocks its pump thread for the stream's whole lifetime, so
-the pump capacity is also the ceiling on concurrently running streams. Waiting
-work is bounded: at most `queue_limit()` tasks wait. The automatic queue limit
-is what remains of the fd budget after reserving one fd per worker (running and
-queued streams both hold a client fd), capped at the capacity. If every worker
-is busy at capacity and the queue is full, the request is not submitted; the
-server writes `503 Service Unavailable` with `Retry-After: 1` and closes the
-connection. The 503 body comes from `set_error_body(503, ...)` when configured.
-
-The queue rules above apply to blocking `take_over`; `take_over_async` bypasses
-the pump entirely and is bounded by the io threads, file descriptors, and
-memory instead.
-
-Workers are elastic. The pool starts with `min(capacity, CPUs)` threads and
-adds a worker only while tasks are backlogged, up to the capacity. Workers
-above the initial size exit after `set_pump_idle_timeout` (default 60 s), so a
-burst's extra threads are reclaimed. The automatic capacity is the smallest
-budget exposed by the process environment:
-
-- thread budget: `pids.max` (cgroup v2/v1), `RLIMIT_NPROC`, kernel
-  `threads-max`/`pid_max`, minus the current thread count, with half reserved
-  for io threads and application threads;
-- fd budget: `RLIMIT_NOFILE` minus a quarter for listeners, upstream sockets,
-  and housekeeping (each streaming response holds one client fd);
-- address-space budget: `RLIMIT_AS` divided by the thread stack size, when a
-  virtual-memory limit is set.
-
-`set_pump_threads(n)`/`REALURL_PUMP_THREADS` override the computed ceiling;
-`set_pump_queue_limit(n)`/`REALURL_PUMP_QUEUE` override the queue.
-`StreamPumpPool::capacity()` reports the ceiling, `size()` the current worker
-count, `queue_limit()` the waiting bound, and `rejected()` the number of
-refused submissions. This keeps the default useful on a 2-core container and
-on a 64-core host without hardcoding a thread count; it also follows the cgroup
-limits that `hardware_concurrency()` ignores.
+`Server::process(raw_request)` parses one HTTP/1.1 request and returns the raw
+response bytes without sockets or worker threads. Fixed responses and
+`take_over_task` are supported; the task runs on a private EventLoop.

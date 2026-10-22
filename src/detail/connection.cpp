@@ -68,10 +68,19 @@ public:
 private:
     friend class H2StreamImpl;
 
+    static void on_timeout(void *context)
+    {
+        auto *waiter = static_cast<HeadAwaiter *>(context);
+        if (!waiter->done_) {
+            waiter->error_ = ETIMEDOUT;
+            waiter->stream_.complete_head(waiter);
+        }
+    }
+
     H2StreamImpl &stream_;
     std::chrono::milliseconds timeout_;
     std::coroutine_handle<> handle_{};
-    TimerId timer_ = 0;
+    TimerNode timer_;
     int error_ = 0;
     bool done_ = false;
 };
@@ -105,11 +114,20 @@ public:
 private:
     friend class H2StreamImpl;
 
+    static void on_timeout(void *context)
+    {
+        auto *waiter = static_cast<ReadAwaiter *>(context);
+        if (!waiter->done_) {
+            waiter->error_ = ETIMEDOUT;
+            waiter->stream_.complete_read(waiter);
+        }
+    }
+
     H2StreamImpl &stream_;
     std::span<char> buffer_;
     std::chrono::milliseconds idle_;
     std::coroutine_handle<> handle_{};
-    TimerId timer_ = 0;
+    TimerNode timer_;
     std::size_t n_ = 0;
     int error_ = 0;
     bool done_ = false;
@@ -142,10 +160,19 @@ public:
 private:
     friend class H2StreamImpl;
 
+    static void on_timeout(void *context)
+    {
+        auto *waiter = static_cast<WriteAwaiter *>(context);
+        if (!waiter->done_) {
+            waiter->error_ = ETIMEDOUT;
+            waiter->stream_.complete_write(waiter);
+        }
+    }
+
     H2StreamImpl &stream_;
     std::chrono::milliseconds timeout_;
     std::coroutine_handle<> handle_{};
-    TimerId timer_ = 0;
+    TimerNode timer_;
     int error_ = 0;
     bool done_ = false;
 };
@@ -177,10 +204,19 @@ public:
 private:
     friend class H2StreamImpl;
 
+    static void on_timeout(void *context)
+    {
+        auto *waiter = static_cast<EndAwaiter *>(context);
+        if (!waiter->done_) {
+            waiter->error_ = ETIMEDOUT;
+            waiter->stream_.complete_end(waiter);
+        }
+    }
+
     H2StreamImpl &stream_;
     std::chrono::milliseconds timeout_;
     std::coroutine_handle<> handle_{};
-    TimerId timer_ = 0;
+    TimerNode timer_;
     int error_ = 0;
     bool done_ = false;
 };
@@ -205,12 +241,7 @@ void H2StreamImpl::start_head(HeadAwaiter *waiter, std::coroutine_handle<> handl
     head_waiter_ = waiter;
     waiter->handle_ = handle;
     if (timeout.count() > 0) {
-        waiter->timer_ = loop_->schedule(timeout, [this, waiter] {
-            if (!waiter->done_) {
-                waiter->error_ = ETIMEDOUT;
-                complete_head(waiter);
-            }
-        });
+        loop_->schedule(waiter->timer_, timeout, &HeadAwaiter::on_timeout, waiter);
     }
 }
 
@@ -219,10 +250,7 @@ void H2StreamImpl::complete_head(HeadAwaiter *waiter)
     if (waiter == nullptr || waiter->done_)
         return;
     waiter->done_ = true;
-    if (waiter->timer_ != 0) {
-        loop_->cancel(waiter->timer_);
-        waiter->timer_ = 0;
-    }
+    loop_->cancel(waiter->timer_);
     if (head_waiter_ == waiter)
         head_waiter_ = nullptr;
     loop_->resume_later(waiter->handle_);
@@ -240,12 +268,7 @@ void H2StreamImpl::start_read(ReadAwaiter *waiter, std::coroutine_handle<> handl
     read_waiter_ = waiter;
     waiter->handle_ = handle;
     if (waiter->idle_.count() > 0) {
-        waiter->timer_ = loop_->schedule(waiter->idle_, [this, waiter] {
-            if (!waiter->done_) {
-                waiter->error_ = ETIMEDOUT;
-                complete_read(waiter);
-            }
-        });
+        loop_->schedule(waiter->timer_, waiter->idle_, &ReadAwaiter::on_timeout, waiter);
     }
 }
 
@@ -254,10 +277,7 @@ void H2StreamImpl::complete_read(ReadAwaiter *waiter)
     if (waiter == nullptr || waiter->done_)
         return;
     waiter->done_ = true;
-    if (waiter->timer_ != 0) {
-        loop_->cancel(waiter->timer_);
-        waiter->timer_ = 0;
-    }
+    loop_->cancel(waiter->timer_);
     if (read_waiter_ == waiter)
         read_waiter_ = nullptr;
     loop_->resume_later(waiter->handle_);
@@ -276,12 +296,7 @@ void H2StreamImpl::start_write(WriteAwaiter *waiter, std::coroutine_handle<> han
     write_waiter_ = waiter;
     waiter->handle_ = handle;
     if (timeout.count() > 0) {
-        waiter->timer_ = loop_->schedule(timeout, [this, waiter] {
-            if (!waiter->done_) {
-                waiter->error_ = ETIMEDOUT;
-                complete_write(waiter);
-            }
-        });
+        loop_->schedule(waiter->timer_, timeout, &WriteAwaiter::on_timeout, waiter);
     }
 }
 
@@ -290,10 +305,7 @@ void H2StreamImpl::complete_write(WriteAwaiter *waiter)
     if (waiter == nullptr || waiter->done_)
         return;
     waiter->done_ = true;
-    if (waiter->timer_ != 0) {
-        loop_->cancel(waiter->timer_);
-        waiter->timer_ = 0;
-    }
+    loop_->cancel(waiter->timer_);
     if (write_waiter_ == waiter)
         write_waiter_ = nullptr;
     loop_->resume_later(waiter->handle_);
@@ -310,12 +322,7 @@ void H2StreamImpl::start_end(EndAwaiter *waiter, std::coroutine_handle<> handle,
     end_waiter_ = waiter;
     waiter->handle_ = handle;
     if (timeout.count() > 0) {
-        waiter->timer_ = loop_->schedule(timeout, [this, waiter] {
-            if (!waiter->done_) {
-                waiter->error_ = ETIMEDOUT;
-                complete_end(waiter);
-            }
-        });
+        loop_->schedule(waiter->timer_, timeout, &EndAwaiter::on_timeout, waiter);
     }
 }
 
@@ -324,10 +331,7 @@ void H2StreamImpl::complete_end(EndAwaiter *waiter)
     if (waiter == nullptr || waiter->done_)
         return;
     waiter->done_ = true;
-    if (waiter->timer_ != 0) {
-        loop_->cancel(waiter->timer_);
-        waiter->timer_ = 0;
-    }
+    loop_->cancel(waiter->timer_);
     if (end_waiter_ == waiter)
         end_waiter_ = nullptr;
     loop_->resume_later(waiter->handle_);
