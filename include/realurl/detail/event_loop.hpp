@@ -123,6 +123,10 @@ T sync_wait(Task<T> task)
             error = std::current_exception();
         }
         done = true;
+        // Stop before run_once() reaches its poll. The task may complete from
+        // a posted callback, in which case the loop would otherwise sleep for
+        // its full poll timeout before observing `done`.
+        loop.stop();
     };
 
     loop.spawn(wrapper());

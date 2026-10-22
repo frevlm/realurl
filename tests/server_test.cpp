@@ -1,4 +1,5 @@
 #include "realurl/server.hpp"
+#include "realurl/stream_pump_pool.hpp"
 #include "support/http1_client.hpp"
 #include "test_harness.hpp"
 
@@ -68,6 +69,22 @@ void test_process_take_over()
     const std::string raw = server.process("GET /raw HTTP/1.1\r\nHost: test\r\n\r\n");
     CHECK(starts_with(raw, "HTTP/1.1 200 OK\r\n"));
     CHECK(raw.find("data: one\n\n") != std::string::npos);
+}
+
+void test_process_async_take_over()
+{
+    realurl::Server server;
+    server.Get("/raw", [](const auto &, auto &res) {
+        res.take_over_async([](realurl::AsyncClientWriter &writer) -> boost::asio::awaitable<void> {
+            if (!(co_await writer.write("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")))
+                co_return;
+            co_await writer.write("async");
+        });
+    });
+
+    const std::string raw = server.process("GET /raw HTTP/1.1\r\nHost: test\r\n\r\n");
+    CHECK(starts_with(raw, "HTTP/1.1 200 OK\r\n"));
+    CHECK(raw.find("\r\n\r\nasync") != std::string::npos);
 }
 
 void test_process_limits()
@@ -247,6 +264,78 @@ std::string read_until(int fd, std::string_view marker)
     return out;
 }
 
+void test_live_pump_rejection()
+{
+    const int port = free_port();
+    CHECK(port > 0);
+    if (port <= 0)
+        return;
+
+    std::atomic<bool> release{ false };
+    realurl::Server server;
+    server.set_io_threads(2);
+    server.Get("/hold", [&release](const auto &, auto &res) {
+        res.take_over([&release](realurl::ClientWriter &writer) {
+            if (!writer("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"))
+                return;
+            while (!release.load(std::memory_order_acquire))
+                std::this_thread::sleep_for(1ms);
+            (void)writer("data: done\n\n");
+        });
+    });
+
+    std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
+    for (int i = 0; i < 200 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(1ms);
+
+    const int first = connect_local(port);
+    std::string first_response;
+    CHECK(first >= 0);
+    if (first >= 0) {
+        CHECK(send_raw(first, "GET /hold HTTP/1.1\r\nHost: test\r\n\r\n"));
+        first_response = read_until(first, "\r\n\r\n");
+        CHECK(first_response.find("HTTP/1.1 200 OK") != std::string::npos);
+    }
+
+    const int queued = connect_local(port);
+    CHECK(queued >= 0);
+    if (queued >= 0) {
+        CHECK(send_raw(queued, "GET /hold HTTP/1.1\r\nHost: test\r\n\r\n"));
+        std::this_thread::sleep_for(20ms);
+    }
+
+    const int rejected = connect_local(port);
+    CHECK(rejected >= 0);
+    if (rejected >= 0) {
+        CHECK(send_raw(rejected, "GET /hold HTTP/1.1\r\nHost: test\r\n\r\n"));
+        const std::string response = read_until_close(rejected);
+        CHECK(response.find("HTTP/1.1 503 Service Unavailable") != std::string::npos);
+        CHECK(response.find("Retry-After: 1\r\n") != std::string::npos);
+    }
+
+    release.store(true, std::memory_order_release);
+
+    if (queued >= 0) {
+        const std::string response = read_until_close(queued);
+        CHECK(response.find("HTTP/1.1 200 OK") != std::string::npos);
+        CHECK(response.find("data: done\n\n") != std::string::npos);
+    }
+    if (first >= 0) {
+        first_response.append(read_until_close(first));
+        CHECK(first_response.find("data: done\n\n") != std::string::npos);
+    }
+
+    if (first >= 0)
+        CHECK(::close(first) == 0);
+    if (queued >= 0)
+        CHECK(::close(queued) == 0);
+    if (rejected >= 0)
+        CHECK(::close(rejected) == 0);
+
+    server.stop();
+    listener.join();
+}
+
 void test_live_expect_continue(int port)
 {
     const int fd = connect_local(port);
@@ -298,6 +387,15 @@ void test_live_requests()
             (void)writer("data: two\n\n");
         });
     });
+    server.Get("/async", [](const auto &, auto &res) {
+        res.take_over_async([](realurl::AsyncClientWriter &writer) -> boost::asio::awaitable<void> {
+            if (!(co_await writer.write("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n")))
+                co_return;
+            if (!(co_await writer.write("async one\n")))
+                co_return;
+            co_await writer.write("async two\n");
+        });
+    });
 
     std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
     for (int i = 0; i < 200 && !server.is_running(); ++i)
@@ -320,6 +418,10 @@ void test_live_requests()
     CHECK(events_response.status == 200);
     CHECK(events_response.body == "data: one\n\ndata: two\n\n");
 
+    auto async_response = test::http1_request(port, "GET", "/async");
+    CHECK(async_response.status == 200);
+    CHECK(async_response.body == "async one\nasync two\n");
+
     test_live_expect_continue(port);
 
     server.stop();
@@ -330,8 +432,12 @@ void test_live_requests()
 
 int main()
 {
+    realurl::StreamPumpPool::configure(1);
+    realurl::StreamPumpPool::configure_queue(1);
+
     test_process_basics();
     test_process_take_over();
+    test_process_async_take_over();
     test_process_limits();
     test_process_streamed_chunked_rejected();
     test_process_streamed_missing_content_length_rejected();
@@ -340,5 +446,6 @@ int main()
     test_process_malformed_target_rejected();
     test_content_type_header();
     test_live_requests();
+    test_live_pump_rejection();
     return test::summary();
 }

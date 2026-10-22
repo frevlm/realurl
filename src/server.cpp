@@ -22,6 +22,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <regex>
@@ -346,6 +347,13 @@ void Server::Response::set_content(std::string body, std::string_view content_ty
 void Server::Response::take_over(TakeOverTask task)
 {
     take_over_ = std::move(task);
+    async_take_over_ = nullptr;
+}
+
+void Server::Response::take_over_async(AsyncTakeOverTask task)
+{
+    async_take_over_ = std::move(task);
+    take_over_ = nullptr;
 }
 
 // ============================================================================
@@ -533,6 +541,22 @@ struct Server::Impl {
             apply_error_body(response, 500);
         }
 
+        if (response.async_taken_over()) {
+            net::io_context io;
+            std::string output;
+            AsyncClientWriter writer([&output](std::string_view data) -> net::awaitable<bool> {
+                output.append(data.data(), data.size());
+                co_return true;
+            });
+            net::co_spawn(io, [&]() -> net::awaitable<void> {
+                try {
+                    co_await response.async_take_over_task()(writer);
+                } catch (...) {
+                }
+            }, net::detached);
+            io.run();
+            return output;
+        }
         if (response.taken_over()) {
             std::string output;
             ClientWriter writer = [&output](std::string_view data) {
@@ -553,12 +577,14 @@ struct Server::Impl {
 
     static net::awaitable<void> write_error(beast::tcp_stream &stream, Impl *impl, int status, bool head_only)
     {
+        stream.expires_after(impl->client_write_timeout);
         co_await write_response(stream, impl->error_response(status, head_only));
     }
 
-    static net::awaitable<void> send_continue(beast::tcp_stream &stream)
+    static net::awaitable<void> send_continue(beast::tcp_stream &stream, Impl *impl)
     {
         static constexpr std::string_view kContinue = "HTTP/1.1 100 Continue\r\n\r\n";
+        stream.expires_after(impl->client_write_timeout);
         boost::system::error_code ec;
         co_await net::async_write(stream, net::buffer(kContinue), net::redirect_error(net::use_awaitable, ec));
     }
@@ -654,6 +680,7 @@ struct Server::Impl {
         if (impl->pre_routing) {
             Response pre_response;
             if (impl->pre_routing(request, pre_response) == HandlerResponse::Handled) {
+                stream.expires_after(impl->client_write_timeout);
                 co_await write_response(stream, serialize_response(pre_response, request.method == "HEAD"));
                 co_return;
             }
@@ -667,7 +694,7 @@ struct Server::Impl {
         request.body_mode = route->body_mode;
 
         if (iequals(request.get_header("Expect"), "100-continue"))
-            co_await send_continue(stream);
+            co_await send_continue(stream, impl);
 
         StreamedBody streamed;
         if (route->body_mode == BodyMode::Buffered) {
@@ -719,20 +746,62 @@ struct Server::Impl {
             }
         }
 
-        if (response.taken_over()) {
+        if (response.async_taken_over()) {
+            auto response_started = std::make_shared<std::atomic_bool>(false);
+            AsyncClientWriter writer([&stream, timeout = impl->client_write_timeout, response_started](
+                                         std::string_view data) -> net::awaitable<bool> {
+                if (data.empty())
+                    co_return true;
+
+                boost::system::error_code ec;
+                stream.expires_after(timeout);
+                co_await net::async_write(stream, net::buffer(data), net::redirect_error(net::use_awaitable, ec));
+                if (ec)
+                    co_return false;
+
+                response_started->store(true, std::memory_order_release);
+                co_return true;
+            });
+
+            std::exception_ptr handler_error;
+            try {
+                co_await response.async_take_over_task()(writer);
+            } catch (...) {
+                handler_error = std::current_exception();
+            }
+
+            if (handler_error && !response_started->load(std::memory_order_acquire))
+                co_await write_error(stream, impl, 500, request.method == "HEAD");
+
+            if (!handler_error && streamed.feeder && streamed.feeder->limit_exceeded() &&
+                !response_started->load(std::memory_order_acquire)) {
+                co_await write_error(stream, impl, 413, request.method == "HEAD");
+            }
+        } else if (response.taken_over()) {
             auto response_started = std::make_shared<std::atomic_bool>(false);
             ClientWriter writer = client_writer_from_fd(stream.socket().native_handle(), impl->client_write_timeout,
                                                         response_started);
             auto gate = stream_pump_pool().submit(
                 [task = response.take_over_task(), &writer]() mutable { task(writer); },
                 stream.get_executor());
-            co_await async_wait_gate(gate, net::use_awaitable);
 
-            if (streamed.feeder && streamed.feeder->limit_exceeded() &&
-                !response_started->load(std::memory_order_acquire)) {
-                co_await write_error(stream, impl, 413, false);
+            if (gate == nullptr) {
+                Response unavailable;
+                unavailable.status = 503;
+                unavailable.set_header("Retry-After", "1");
+                impl->apply_error_body(unavailable, 503);
+                stream.expires_after(impl->client_write_timeout);
+                co_await write_response(stream, serialize_response(unavailable, request.method == "HEAD"));
+            } else {
+                co_await async_wait_gate(gate, net::use_awaitable);
+
+                if (streamed.feeder && streamed.feeder->limit_exceeded() &&
+                    !response_started->load(std::memory_order_acquire)) {
+                    co_await write_error(stream, impl, 413, false);
+                }
             }
         } else {
+            stream.expires_after(impl->client_write_timeout);
             co_await write_response(stream, serialize_response(response, request.method == "HEAD"));
         }
 
@@ -929,6 +998,24 @@ Server &Server::set_client_write_timeout(std::chrono::milliseconds timeout)
 Server &Server::set_io_threads(unsigned count)
 {
     impl_->io_threads = count;
+    return *this;
+}
+
+Server &Server::set_pump_threads(unsigned count)
+{
+    StreamPumpPool::configure(count);
+    return *this;
+}
+
+Server &Server::set_pump_queue_limit(unsigned count)
+{
+    StreamPumpPool::configure_queue(count);
+    return *this;
+}
+
+Server &Server::set_pump_idle_timeout(std::chrono::milliseconds timeout)
+{
+    StreamPumpPool::configure_idle(timeout);
     return *this;
 }
 

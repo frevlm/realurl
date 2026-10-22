@@ -40,6 +40,169 @@ It stays opt-in because it is Linux-only and because one-shot recv/send still
 costs one `io_uring_enter` per operation; batching or multishot is the next
 step before claiming a throughput win.
 
+### Stream pump scaling (`pump`)
+
+`take_over` streams run one per pump worker, so the worker capacity is the
+ceiling on concurrently running streams. Workers start at `min(capacity, CPUs)`
+and grow on demand; the automatic capacity comes from the process thread, fd,
+and address-space budgets rather than a core multiple (see `docs/server.md`).
+This sweep uses a 1 s SSE-style response (10 chunks, 100 ms apart), all requests
+released together, with an in-process single-threaded poll client on the same
+M5 (10 cores). `REALURL_PUMP_THREADS` pins the capacity for the comparison.
+
+| Capacity | Concurrency | Waves | Wall | TTFT p50 | TTFT p99 | Total p50 | Peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 40 | 40 | 1.0 | 1.06 s | 0.7 ms | 0.8 ms | 1.05 s | 3.5 MB |
+| 40 | 128 | 3.2 | 4.14 s | 1.04 s | 3.09 s | 2.07 s | 4.0 MB |
+| 40 | 512 | 12.8 | 13.51 s | 6.21 s | 12.44 s | 7.25 s | 6.1 MB |
+| 64 | 512 | 8.0 | 8.35 s | 3.15 s | 7.29 s | 4.20 s | 6.4 MB |
+| 128 | 512 | 4.0 | 4.22 s | 1.07 s | 3.12 s | 2.12 s | 7.7 MB |
+| 256 | 512 | 2.0 | 2.13 s | 5.2 ms | 1.05 s | 1.06 s | 9.8 MB |
+
+Reading:
+
+- TTFT is quantized into waves: once concurrency exceeds the pool size, a
+  stream waits `ceil(C / P) - 1` stream durations before it starts. Raising the
+  pool divides that wait proportionally (12.8 -> 8 -> 4 -> 2 waves).
+- CPU stays under 1 s for 512 streams because pump threads sleep between chunks
+  or block on the client socket. On this host there is no CPU knee up to 256
+  threads: the cost is one OS thread per concurrent stream (~14 KB touched per
+  idle thread, plus stack address space), not scheduler throughput.
+- The benchmark raises the queue limit to the concurrency so it measures
+  queueing instead of load shedding. In production the automatic queue is the
+  fd-budget remainder capped at capacity; once every worker is busy and the
+  queue is full, new streams receive 503 with `Retry-After: 1` instead of
+  waiting without bound. The 12 s tail above is therefore a deliberate
+  worst-case measurement, not the steady-state overload behavior.
+
+With no override the pool starts at `min(capacity, CPUs)` and grows on demand.
+On the M5 the automatic capacity is 1333 (`RLIMIT_NPROC / 2`), so the
+512-stream run grows to 512 workers and finishes one wave in 1.06 s
+(TTFT p50 4.0 ms). In a 2-core / 2 GB container the automatic capacity is
+15810 (`threads-max / 2`); 512 streams still complete in one wave (1.02 s,
+0.15 s CPU), while pinning the old-style capacity of 16 takes 8 waves (8.02 s).
+The ceiling follows the process budget, the actual worker count follows the
+load; workers above the initial size are reclaimed after the idle timeout.
+
+Reproduce:
+
+```sh
+./build/bench/realurl_bench pump 512 10 100 30000                       # automatic capacity
+REALURL_PUMP_THREADS=128 ./build/bench/realurl_bench pump 512 10 100 30000  # pinned capacity
+```
+
+The poll client is single-threaded, so the RSS column reflects the server plus
+sockets rather than one client thread per stream.
+
+### Async takeover (`async`)
+
+`take_over_async` runs one coroutine per stream on the io threads, with no pump
+worker. Same 1 s SSE shape and single-threaded poll client:
+
+| Host | Concurrency | Wall | TTFT p50 | TTFT p99 | CPU | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| M5, 2 io threads | 4096 | 1.09 s | 16.9 ms | 23.4 ms | 0.70 s | 28.6 MB |
+| 2-core / 2 GB container | 4096 | 1.03 s | 12.6 ms | 24.1 ms | 0.44 s | 24.9 MB |
+| 2-core / 2 GB container | 8192 | 1.05 s | 25.7 ms | 48.6 ms | 0.85 s | 45.3 MB |
+
+For contrast, the blocking pump pinned to 40 workers and given 4096 streams
+hits the 60 s client timeout with 1736 unfinished streams. Async removes the
+thread-per-stream ceiling; concurrency is bounded by fds, memory, and the io
+threads instead.
+
+```sh
+./build/bench/realurl_bench async 8192 10 100 60000
+```
+
+### Proxy bridge (`proxy`)
+
+`proxy` puts the HTTP/1.1 server in front of the in-process h2c test server.
+The handler either co_awaits `realurl::async_request()` (`bridge`) or calls
+`realurl::sync_wait(group.request(...))` on the io thread (`block`). Both use
+2 io threads, one `ClientGroup` worker, and `max_streams_per_conn` set to the
+concurrency. `chunks`/`interval_ms` shape the upstream stream; the test server
+sleeps in 20 ms steps, so 10 x 100 ms measures ~0.68 s.
+
+M5 / macOS (10 cores):
+
+| Mode | Concurrency | Upstream | Wall | TTFT p50 | CPU | Peak RSS |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| bridge | 16 | 10 x 100 ms | 0.71 s | 678.6 ms | 0.02 s | 6.0 MB |
+| block | 16 | 10 x 100 ms | 5.39 s | 2699.3 ms | 0.03 s | 5.5 MB |
+| bridge | 2048 | 1 x 10 ms | 0.05 s | 38.1 ms | 0.20 s | 122.4 MB |
+| block | 2048 | 1 x 10 ms | 26.43 s | 13267.6 ms | 5.05 s | 47.2 MB |
+| bridge | 2048 | 10 x 100 ms | 0.77 s | 691.0 ms | 1.04 s | 121.9 MB |
+
+2-core / 2 GB Linux container:
+
+| Mode | Concurrency | Upstream | Wall | TTFT p50 | CPU | Peak RSS |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| bridge | 2048 | 1 x 10 ms | 0.13 s | 64.1 ms | 0.14 s | 59.0 MB |
+| block | 2048 | 1 x 10 ms | 43.50 s | 21850.7 ms | 2.73 s | 31.0 MB |
+| bridge | 2048 | 10 x 100 ms | 0.69 s | 658.6 ms | 0.37 s | 60.1 MB |
+
+Reading:
+
+- Blocking on the io thread leaves only `io_threads` upstream requests in
+  flight. Wall tracks `ceil(C / 2) x upstream_duration`: 16/2 x 0.68 s = 5.4 s
+  and 2048/2 x 0.026 s = 26.5 s on macOS, 2048/2 x 0.043 s = 44 s in the
+  container. Measured values match.
+- The bridge finishes in about one upstream duration regardless of C:
+  2048 concurrent ~0.68 s upstream streams complete in 0.69-0.77 s with zero
+  failures on both hosts. One worker multiplexes all streams over one h2
+  connection; the limit is fds, memory, and `max_streams_per_conn`.
+- RSS is not a bridge-vs-block comparison: the test upstream spawns one thread
+  per delayed response, so the bridge runs hold 2048 helper threads while the
+  blocking runs hold two. CPU/RSS include that test server.
+- The 2048-connection blocking runs also hit the server's 5 s read-header
+  timeout because the connections queued behind two blocked io threads; the
+  benchmark disables it. The same head-of-line timeout is a real production
+  symptom of blocking an io thread.
+- `sync_wait` used to poll for its full timeout after the awaited task
+  completed, adding a 1 s tail to every serialized request. That is fixed;
+  without the fix the blocking column would be 1 s per request higher.
+
+Reproduce:
+
+```sh
+./build/bench/realurl_bench proxy 2048 1 10 120000 1 bridge
+./build/bench/realurl_bench proxy 2048 1 10 120000 1 block
+./build/bench/realurl_bench proxy 2048 10 100 120000 1 bridge
+```
+
+### Proxy LLM (`proxy_llm`)
+
+`proxy_llm` sends a 2 MB POST body through the HTTP/1.1 proxy, forwards it to
+the h2c test server, and waits for a 20 s SSE-style response (20 chunks,
+100 ms apart). 100 concurrent, one ClientGroup worker, 2 io threads:
+
+| Host | Wall | TTFT p50 | CPU | Peak RSS | Upload verified |
+| --- | ---: | ---: | ---: | ---: | --- |
+| M5 | 20.75 s | 20250.8 ms | 2.23 s | 228.2 MB | 200 MB / 200 MB |
+| 2-core / 2 GB | 20.82 s | 20726.0 ms | 1.65 s | 425.5 MB | 200 MB / 200 MB |
+
+Direct-client baseline from the `llm` section (100 concurrent, 20 s streaming,
+2 MB uploads): total 20.45 s, TTFT p50 1138.8 ms, CPU 1.22 s, peak RSS
+557.5 MB.
+
+Reading:
+
+- The buffered bridge preserves completion time and upload correctness, but
+  TTFT becomes the whole upstream duration (~20 s): `async_request()` returns
+  only after the response body is complete. It cannot be used for token-level
+  SSE relaying.
+- CPU grows by about 1 s per 100 requests (proxy hop plus 2 MB forwarding);
+  the extra RSS is the in-flight request bodies.
+- A streaming bridge (bounded chunk queue with backpressure) is required to
+  restore the ~1 s TTFT. Until then, use the direct client for streaming
+  responses.
+
+Reproduce:
+
+```sh
+./build/bench/realurl_bench proxy_llm 100 20 2097152 1 bridge
+```
+
 ## 0.3 baseline: `realurl_bench requests <N> <concurrency>`
 
 20,000 `client.get()` requests over one multiplexed connection:
@@ -172,3 +335,7 @@ cmake --build build
 3. The io_uring transport submits one recv or send per `io_uring_enter`.
    Multishot recv with provided buffers and SQPOLL are the next steps for that
    backend.
+4. `realurl::async_request()` buffers the upstream response before completing.
+   A streaming bridge with a bounded chunk queue and backpressure is still
+   missing, so token-level SSE relaying through the proxy keeps TTFT at the full
+   upstream duration.

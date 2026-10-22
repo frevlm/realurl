@@ -4,6 +4,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -62,6 +63,24 @@ int main()
         loop.spawn(poster());
         loop.run();
         CHECK(count == 10000);
+    }
+
+    {
+        realurl::EventLoop loop;
+        bool posted = false;
+        const auto start = std::chrono::steady_clock::now();
+        std::thread poster([&] {
+            std::this_thread::sleep_for(50ms);
+            loop.post([&] {
+                posted = true;
+                loop.stop();
+            });
+        });
+        loop.run();
+        poster.join();
+        const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        CHECK(posted);
+        CHECK(elapsed < 0.5);
     }
 
     {

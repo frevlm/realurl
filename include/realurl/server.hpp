@@ -3,6 +3,8 @@
 #include <realurl/body_source.hpp>
 #include <realurl/fd_writer.hpp>
 
+#include <boost/asio/awaitable.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -17,13 +19,39 @@
 namespace realurl
 {
 
+/// Sink behind AsyncClientWriter; provided by the server's connection loop.
+using AsyncWriterSink = std::function<boost::asio::awaitable<bool>(std::string_view)>;
+
+/// Awaitable writer used by take_over_async().
+///
+/// write() suspends the handler coroutine until the client socket accepts the
+/// bytes, so one io thread can drive thousands of concurrent streams.  It
+/// returns false when the client disconnected or the write timeout expired.
+class AsyncClientWriter
+{
+public:
+    explicit AsyncClientWriter(AsyncWriterSink sink)
+        : sink_(std::move(sink))
+    {
+    }
+
+    boost::asio::awaitable<bool> write(std::string_view data)
+    {
+        return sink_(data);
+    }
+
+private:
+    AsyncWriterSink sink_;
+};
+
 /// Minimal HTTP/1.1 server with an httplib-like routing API.
 ///
 /// Requests carry either a fully buffered body (management JSON endpoints) or
 /// a pull-based BodySource (large streaming uploads).  Responses are either a
-/// fixed body (set_content) or a raw connection takeover (take_over), where
-/// the handler writes the status line, headers, and body through a
-/// ClientWriter.  Every response closes the connection.
+/// fixed body (set_content), a blocking takeover (take_over) on a pump thread,
+/// or a coroutine takeover (take_over_async) on an io thread.  Takeover
+/// handlers write the status line, headers, and body themselves.  Every
+/// response closes the connection.
 class Server
 {
 public:
@@ -31,6 +59,7 @@ public:
     enum class HandlerResponse { Handled, Unhandled };
 
     using TakeOverTask = std::function<void(ClientWriter &)>;
+    using AsyncTakeOverTask = std::function<boost::asio::awaitable<void>(AsyncClientWriter &)>;
 
     struct Request
     {
@@ -76,14 +105,26 @@ public:
 
         void set_content(std::string body, std::string_view content_type = {});
 
-        /// Take over the raw connection.  The task writes the response head and
-        /// body through the ClientWriter.  The server runs it on a pump thread
-        /// and keeps the connection open until it returns.
+        /// Take over the raw connection with a blocking task.  The task writes
+        /// the response head and body through the ClientWriter.  The server
+        /// runs it on a pump thread and keeps the connection open until it
+        /// returns.  Prefer take_over_async() for thousands of streams.
         void take_over(TakeOverTask task);
+
+        /// Take over the raw connection with a coroutine.  The handler runs on
+        /// an io thread and co_awaits AsyncClientWriter::write(); it must not
+        /// block.  No pump thread is used, so this path is not bounded by the
+        /// pump capacity or queue.
+        void take_over_async(AsyncTakeOverTask task);
 
         bool taken_over() const
         {
-            return static_cast<bool>(take_over_);
+            return static_cast<bool>(take_over_) || static_cast<bool>(async_take_over_);
+        }
+
+        bool async_taken_over() const
+        {
+            return static_cast<bool>(async_take_over_);
         }
 
         const TakeOverTask &take_over_task() const
@@ -91,8 +132,14 @@ public:
             return take_over_;
         }
 
+        const AsyncTakeOverTask &async_take_over_task() const
+        {
+            return async_take_over_;
+        }
+
     private:
         TakeOverTask take_over_;
+        AsyncTakeOverTask async_take_over_;
     };
 
     using Handler = std::function<void(const Request &, Response &)>;
@@ -137,6 +184,24 @@ public:
 
     /// 0 = std::thread::hardware_concurrency().
     Server &set_io_threads(unsigned count);
+
+    /// Capacity for take_over streaming responses.  A task occupies one thread
+    /// for the stream's whole lifetime, so this bounds concurrent streams.
+    /// 0 = automatic (derived from the process thread, fd, and address-space
+    /// budgets; workers grow on demand).  Must be called before the first
+    /// take_over request; ignored afterwards.
+    Server &set_pump_threads(unsigned count);
+
+    /// Maximum take_over tasks waiting for a pump worker.  0 = automatic
+    /// (the pump capacity).  When saturated, new take_over requests receive
+    /// 503 with Retry-After instead of queueing without bound.
+    /// Must be called before the first take_over request; ignored afterwards.
+    Server &set_pump_queue_limit(unsigned count);
+
+    /// Idle time after which workers above the initial size exit.  0 disables
+    /// shrinking.  Default 60 s (REALURL_PUMP_IDLE_MS).  Must be called before
+    /// the first take_over request.
+    Server &set_pump_idle_timeout(std::chrono::milliseconds timeout);
 
     /// Decode percent escapes in Request::path.  Default true; streaming
     /// listeners that must preserve the raw path can disable it.

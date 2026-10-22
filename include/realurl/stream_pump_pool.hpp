@@ -7,10 +7,12 @@
 #include <boost/asio/post.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -93,22 +95,74 @@ template <typename CompletionToken> auto async_wait_gate(std::shared_ptr<StreamG
 
 /// Bounded pool of long-lived pump threads.
 ///
-/// Each thread owns a persistent TLS CurlMultiPool (via upstream.cpp), so
-/// upstream connections are reused across the streams it processes.  Tasks
-/// share one global FIFO queue and run on whichever worker is free: no client
-/// or IP is pinned to a thread or serialized behind another stream.
+/// Tasks share one global FIFO queue and run on whichever worker is free: no
+/// client or IP is pinned to a thread or serialized behind another stream.
+/// A task blocks its thread until it returns, so capacity() is the ceiling on
+/// concurrently running streams; excess submissions wait in the queue.
+///
+/// Workers are created on demand: the pool starts with min(capacity(), CPUs)
+/// threads and grows while tasks are backlogged.  The automatic capacity is
+/// derived from the process resource budgets - the smallest of the thread
+/// budget (cgroup pids.max, RLIMIT_NPROC, kernel threads-max/pid_max), the
+/// file-descriptor budget (RLIMIT_NOFILE minus headroom), and the address
+/// space budget (RLIMIT_AS divided by the thread stack) - and is never below
+/// one.  configure() or REALURL_PUMP_THREADS overrides the computed ceiling.
+///
+/// Waiting work is bounded too: once every worker is busy at capacity() and
+/// queue_limit() tasks are already waiting, submit() refuses the task instead
+/// of growing an unbounded backlog.  The queue defaults to what remains of the
+/// fd budget after the workers, capped at capacity(), and can be overridden
+/// with configure_queue() or REALURL_PUMP_QUEUE.
 class StreamPumpPool {
 public:
     static StreamPumpPool &instance();
 
+    /// Set the capacity used when the singleton is constructed. 0 restores the
+    /// automatic calculation.  Ignored once the pool has started.
+    static void configure(size_t count);
+
+    /// Set the queue limit used when the singleton is constructed. 0 restores
+    /// the automatic value.  Ignored once the pool has started.
+    static void configure_queue(size_t limit);
+
+    /// Idle time before workers above the initial size exit. 0 disables
+    /// shrinking.  Ignored once the pool has started.
+    static void configure_idle(std::chrono::milliseconds timeout);
+
     /// Run `task` on a pump thread.  Returns a gate that the connection
     /// coroutine co_awaits; the gate is finished automatically when the task
-    /// returns or throws.
+    /// returns or throws.  Returns nullptr when the pool is at capacity and
+    /// its queue is full; the caller should shed load (the server returns 503).
     std::shared_ptr<StreamGate> submit(std::function<void()> task, boost::asio::any_io_executor io_ex);
 
+    /// Current number of worker threads (grows on demand up to capacity()).
     size_t size() const
     {
-        return size_;
+        return size_.load(std::memory_order_relaxed);
+    }
+
+    /// Ceiling on concurrent workers; see the class comment.
+    size_t capacity() const
+    {
+        return capacity_.load(std::memory_order_relaxed);
+    }
+
+    /// Maximum number of tasks allowed to wait for a worker.
+    size_t queue_limit() const
+    {
+        return queue_limit_.load(std::memory_order_relaxed);
+    }
+
+    /// Total submissions refused because the queue was full.
+    size_t rejected() const
+    {
+        return rejected_.load(std::memory_order_relaxed);
+    }
+
+    /// Configured idle timeout; 0 means workers are never reclaimed.
+    std::chrono::milliseconds idle_timeout() const
+    {
+        return idle_timeout_;
     }
 
     void shutdown();
@@ -119,11 +173,22 @@ private:
     StreamPumpPool(const StreamPumpPool &) = delete;
     StreamPumpPool &operator=(const StreamPumpPool &) = delete;
 
+    void worker_loop();
+    void retire_worker_locked();
+    bool spawn_worker_locked();
+
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<std::function<void()>> tasks_;
-    std::vector<std::thread> threads_;
-    size_t size_ = 0;
+    std::list<std::thread> threads_;
+    std::list<std::thread> retired_;
+    size_t busy_ = 0;       // guarded by mu_
+    size_t min_workers_ = 0; // guarded by mu_
+    std::chrono::milliseconds idle_timeout_{ 0 };
+    std::atomic<size_t> size_{ 0 };
+    std::atomic<size_t> capacity_{ 0 };
+    std::atomic<size_t> queue_limit_{ 0 };
+    std::atomic<size_t> rejected_{ 0 };
     std::atomic<bool> stop_{ false };
 };
 

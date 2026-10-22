@@ -6,12 +6,22 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 namespace
 {
 
 using namespace std::chrono_literals;
+
+void test_configured_size()
+{
+    ::setenv("REALURL_PUMP_THREADS", "1", 1);
+    realurl::StreamPumpPool::configure(3);
+    CHECK(realurl::stream_pump_pool().capacity() == 3);
+    CHECK(realurl::stream_pump_pool().size() >= 1);
+    CHECK(realurl::stream_pump_pool().size() <= 3);
+}
 
 void test_completion()
 {
@@ -69,12 +79,15 @@ void test_concurrency()
 
     CHECK(completed.load() == 4);
     CHECK(peak.load() > 1);
+    CHECK(realurl::stream_pump_pool().size() > 1);
+    CHECK(realurl::stream_pump_pool().size() <= realurl::stream_pump_pool().capacity());
 }
 
 } // namespace
 
 int main()
 {
+    test_configured_size();
     test_completion();
     test_concurrency();
     return test::summary();
