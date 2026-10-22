@@ -7,6 +7,8 @@
 
 #include <deque>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,7 +23,8 @@ class H2ServerConnection : public std::enable_shared_from_this<H2ServerConnectio
 {
 public:
     H2ServerConnection(ServerContext &context, EventLoop &loop,
-                       std::unique_ptr<Transport> transport, sockaddr_storage peer, Client *upstream);
+                       std::unique_ptr<Transport> transport, sockaddr_storage peer, Client *upstream,
+                       WireMode mode);
     ~H2ServerConnection();
 
     H2ServerConnection(const H2ServerConnection &) = delete;
@@ -63,6 +66,10 @@ public:
         return max_frame_size_;
     }
 
+    /// Encode an HTTP/2 or native response head into `out`.
+    bool encode_response_head(int status, std::span<const Header> headers,
+                              std::optional<std::uint64_t> content_length, std::string &out);
+
 private:
     friend class H2ServerStream;
 
@@ -85,6 +92,7 @@ private:
     EventLoop &loop_;
     std::unique_ptr<Transport> transport_;
     Client *upstream_ = nullptr;
+    WireMode mode_ = WireMode::Http2;
     sockaddr_storage peer_{};
     std::string remote_addr_;
     int remote_port_ = 0;
@@ -121,6 +129,6 @@ private:
 
 Task<void> run_h2_server(ServerContext &context, EventLoop &loop,
                          std::unique_ptr<Transport> transport, sockaddr_storage peer,
-                         Client *upstream);
+                         Client *upstream, WireMode mode = WireMode::Http2);
 
 } // namespace realurl::detail

@@ -35,6 +35,16 @@ constexpr int kSendFlags = MSG_NOSIGNAL;
 constexpr int kSendFlags = 0;
 #endif
 
+void set_nosigpipe(int fd) noexcept
+{
+#ifdef SO_NOSIGPIPE
+    const int on = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+    (void)fd;
+#endif
+}
+
 std::uint32_t read_be24(const char *data)
 {
     return (static_cast<std::uint32_t>(static_cast<unsigned char>(data[0])) << 16) |
@@ -481,6 +491,7 @@ void H2TestServer::serve()
         const int client = ::accept(listen_fd_, nullptr, nullptr);
         if (client < 0)
             continue;
+        set_nosigpipe(client);
 
         timeval timeout{ 60, 0 };
         (void)::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
@@ -572,6 +583,7 @@ void H2TlsTestServer::serve()
         const int fd = ::accept(listen_fd_, nullptr, nullptr);
         if (fd < 0)
             continue;
+        set_nosigpipe(fd);
 
         auto worker = std::make_unique<ClientWorker>();
         auto *w = worker.get();

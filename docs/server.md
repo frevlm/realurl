@@ -215,6 +215,37 @@ outbound flow control are tracked per stream and per connection. The H2 writer
 round-robins streams so one slow stream cannot exhaust the shared connection
 window.
 
+## Native downstream (realurl/1)
+
+The server also accepts the realurl native transport from realurl clients. It
+is enabled by default:
+
+```cpp
+server.set_native(false);   // before listen(): HTTP/1.1 + HTTP/2 only
+```
+
+- TLS clients that offer ALPN `realurl/1` get the native codec; clients that
+  offer only `h2` or `http/1.1` are unaffected.
+- Plaintext clients are detected by the 11-byte `REALURL/1\r\n` preamble,
+  before the h2 preface; anything else is HTTP/1.1.
+- Handlers and takeover writers are unchanged. In native requests,
+  `Request::version` is `"realurl/1"`; `:authority` and `:scheme` are not
+  transmitted, so `host` is only present if the caller set it as a regular
+  header.
+- `Server::Stats` reports `h1_connections`, `h2_connections` and
+  `native_connections`.
+
+The upstream client configured with `set_upstream()` takes the same
+`realurl::Config`, so a gateway can proxy native downstream to native upstream:
+
+```cpp
+realurl::Config upstream;
+upstream.protocol = realurl::Protocol::Auto;   // or Protocol::Native
+server.set_upstream(upstream);
+```
+
+See `docs/native.md` for the wire format and negotiation.
+
 ## TLS and kTLS
 
 ```cpp

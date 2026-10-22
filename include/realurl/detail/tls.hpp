@@ -25,8 +25,9 @@ using SSL = ::ssl_st;
 class TlsContext {
 public:
     /// `ca_file` may be empty, in which case the system trust store is used.
+    /// `offer_native` adds realurl/1 to the ALPN list ahead of h2.
     /// Throws std::runtime_error when the context cannot be created.
-    static std::shared_ptr<TlsContext> create(std::string_view ca_file);
+    static std::shared_ptr<TlsContext> create(std::string_view ca_file, bool offer_native);
 
     ~TlsContext();
 
@@ -70,11 +71,17 @@ public:
 
     void close() noexcept override;
 
+    std::string_view alpn() const noexcept override
+    {
+        return alpn_;
+    }
+
 private:
-    TlsStream(TcpStream socket, SSL *ssl);
+    TlsStream(TcpStream socket, SSL *ssl, std::string alpn);
 
     TcpStream socket_;
     SSL *ssl_ = nullptr;
+    std::string alpn_;
 };
 
 } // namespace realurl::detail

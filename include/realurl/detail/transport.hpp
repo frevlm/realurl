@@ -21,6 +21,12 @@ public:
     virtual Task<void> shutdown_write() = 0;
     virtual int fd() const = 0;
     virtual void close() = 0;
+
+    /// ALPN protocol selected by TLS; empty for plaintext transports.
+    virtual std::string_view alpn() const noexcept
+    {
+        return {};
+    }
 };
 
 } // namespace realurl::detail

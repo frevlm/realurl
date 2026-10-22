@@ -110,7 +110,7 @@ int main()
 {
     auto context = realurl::detail::TlsServerContext::create(REALURL_CERT_DIR "/localhost.pem",
                                                              REALURL_CERT_DIR "/localhost-key.pem",
-                                                             true);
+                                                             true, true);
 
     realurl::detail::EventLoop loop;
     realurl::detail::TcpListener listener(loop, 0);

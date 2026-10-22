@@ -26,6 +26,7 @@ realurl_add_test(timer_wheel_test)
 realurl_add_test(socket_test)
 realurl_add_test(frame_test)
 realurl_add_test(hpack_test)
+realurl_add_test(native_codec_test)
 realurl_add_test(client_test)
 target_link_libraries(client_test PRIVATE realurl_test_support)
 target_compile_definitions(client_test PRIVATE REALURL_CERT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/certs")
@@ -44,6 +45,10 @@ target_link_libraries(proxy_test PRIVATE realurl::server realurl_test_support)
 
 realurl_add_test(h2_server_test)
 target_link_libraries(h2_server_test PRIVATE realurl::server realurl_test_support)
+
+realurl_add_test(native_server_test)
+target_link_libraries(native_server_test PRIVATE realurl::server realurl_test_support OpenSSL::SSL OpenSSL::Crypto)
+target_compile_definitions(native_server_test PRIVATE REALURL_CERT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/certs")
 
 realurl_add_test(tls_server_test)
 target_link_libraries(tls_server_test PRIVATE realurl::server realurl_test_support OpenSSL::SSL OpenSSL::Crypto)

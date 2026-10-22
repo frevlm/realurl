@@ -7,6 +7,87 @@ the clocks, so percentiles reflect steady state. RSS/CPU include the in-tree
 test server that runs in the same process. The tables below the architecture
 pass are the original 0.3 baseline.
 
+## Native transport A/B (realurl/1, 0.5)
+
+Measured on Apple M5 / macOS, loopback, Release build, OpenSSL 3.6.5. Both
+protocols use the same realurl `Server` and the same handler; only
+`Config::protocol` changes (`Protocol::Http2` vs `Protocol::Native`). Runs are
+interleaved on the same machine, one event loop and one connection. The
+1,000-way table reports every run plus the median; the first h2 run is an
+outlier and is kept rather than hidden.
+
+### Unary: 50,000 requests, 1,000 streams, 1 connection
+
+| Protocol | Run | req/s | p50 | p99 | CPU/req | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| h2 | 1 | 477,837 | 1.787 ms | 5.961 ms | 3.1 µs | 81.8 MB |
+| h2 | 2 | 711,702 | 1.308 ms | 3.466 ms | 1.5 µs | 82.1 MB |
+| h2 | 3 | 686,534 | 1.368 ms | 3.483 ms | 1.6 µs | 81.8 MB |
+| native | 1 | 903,495 | 0.964 ms | 2.882 ms | 1.3 µs | 82.1 MB |
+| native | 2 | 926,813 | 0.976 ms | 3.000 ms | 1.2 µs | 82.1 MB |
+| native | 3 | 921,024 | 0.993 ms | 3.021 ms | 1.2 µs | 82.4 MB |
+| **median h2** | | **686,534** | **1.368 ms** | **3.483 ms** | **1.6 µs** | **81.8 MB** |
+| **median native** | | **921,024** | **0.976 ms** | **3.021 ms** | **1.2 µs** | **82.1 MB** |
+
+Native vs h2 on the medians: **+34% throughput, -29% p50, -25% cpu/req**, with
+no RSS change.
+
+### Single stream: 20,000 requests, concurrency 1
+
+| Protocol | Run | req/s | p50 | p99 | CPU/req |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| h2 | 1 | 55,508 | 0.017 ms | 0.037 ms | 14.4 µs |
+| h2 | 2 | 58,619 | 0.017 ms | 0.024 ms | 14.1 µs |
+| h2 | 3 | 58,411 | 0.017 ms | 0.025 ms | 14.2 µs |
+| native | 1 | 61,582 | 0.016 ms | 0.023 ms | 12.8 µs |
+| native | 2 | 61,528 | 0.016 ms | 0.023 ms | 12.9 µs |
+| native | 3 | 61,996 | 0.016 ms | 0.023 ms | 12.7 µs |
+
+Native: **+5.5% throughput, -9% cpu/req**, p50 0.016 vs 0.017 ms. The 10%
+single-stream p50 gate was not met: the latency difference is one clock tick
+at this resolution, so cpu/req and throughput are the meaningful figures.
+This path is dominated by the socket round trip, not header codec work.
+
+### 2 MiB upload + 20 s SSE: 100 concurrency, 1 connection
+
+| Protocol | Wall | TTFT p50 | TTFT p99 | CPU/req | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| h2 | 19.09 s | 78.3 ms | 86.5 ms | 1.415 ms | 576.2 MB |
+| native | 19.08 s | 70.1 ms | 79.5 ms | 1.238 ms | 582.9 MB |
+
+Wall time is identical, TTFT is 10% lower, cpu/req is 12.5% lower, and peak
+RSS is +1.2% (within the +5% gate). `content-length` in the native response
+head lets the client reserve the body, and the head codec removes per-request
+header allocations.
+
+### Large body + delayed response: 2 MiB upload, 5 s delay, 20 concurrency
+
+| Protocol | Wall | TTFT p50 | Peak RSS |
+| --- | ---: | ---: | ---: |
+| h2 | 5.02 s | 5016.8 ms | 152.1 MB |
+| native | 5.02 s | 5021.0 ms | 140.5 MB |
+
+The artificial delay dominates; the expected parity holds. Native peak RSS was
+lower in this run (140.5 vs 152.1 MB).
+
+### Reproduce
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DREALURL_BUILD_BENCH=ON
+cmake --build build --target realurl_bench
+
+./build/bench/realurl_bench h2_unary 50000 1000 1 h2
+./build/bench/realurl_bench h2_unary 50000 1000 1 native
+./build/bench/realurl_bench h2_unary 20000 1 1 h2
+./build/bench/realurl_bench h2_unary 20000 1 1 native
+./build/bench/realurl_bench native_llm 100 100 20 1 1 h2
+./build/bench/realurl_bench native_llm 100 100 20 1 1 native
+```
+
+`native_llm` uses a realurl `Server` endpoint for both protocols; the
+historical `llm` mode still uses the in-tree h2-only test server and is not
+directly comparable to these A/B numbers.
+
 ## Single-runtime server (0.4)
 
 Measured on Apple M5 / macOS, loopback, Release build, OpenSSL 3.6.5. The

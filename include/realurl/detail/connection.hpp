@@ -3,6 +3,7 @@
 #include "realurl/detail/event_loop.hpp"
 #include "realurl/detail/frame.hpp"
 #include "realurl/detail/hpack.hpp"
+#include "realurl/detail/protocol.hpp"
 #include "realurl/detail/socket.hpp"
 #include "realurl/detail/transport.hpp"
 #include "realurl/http2.hpp"
@@ -13,7 +14,9 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -35,6 +38,16 @@ using h2::kDefaultMaxFrameSize;
 
 class H2Connection;
 class H2StreamImpl;
+
+/// Thrown by the plaintext native probe when the peer does not speak
+/// realurl/1. The client uses it to fall back to h2c.
+class NativeUnsupported : public std::runtime_error {
+public:
+    NativeUnsupported()
+        : std::runtime_error("peer does not speak realurl/1")
+    {
+    }
+};
 
 enum class PumpResult {
     NoWork,
@@ -96,7 +109,7 @@ public:
     Task<void> end(std::chrono::milliseconds timeout);
     void cancel();
 
-    void on_headers(HeaderList &&headers, bool end_stream);
+    void on_head(ResponseHead &&head, bool end_stream);
     void on_data(std::string_view data, bool end_stream, std::uint32_t flow_bytes);
     void on_rst(ErrorCode code);
     void on_window_update(std::uint32_t increment);
@@ -181,11 +194,14 @@ private:
 
 class H2Connection : public std::enable_shared_from_this<H2Connection> {
 public:
-    static Task<std::shared_ptr<H2Connection>> connect(EventLoop &loop, std::unique_ptr<Transport> transport,
-                                                       std::string authority, std::string scheme);
+    static Task<std::shared_ptr<H2Connection>> connect(
+        EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority,
+        std::string scheme, WireMode mode = WireMode::Http2, bool probe_native = false,
+        std::chrono::milliseconds probe_timeout = std::chrono::milliseconds{ 1000 });
 
     std::shared_ptr<H2StreamImpl> open(std::string_view method, std::string_view path, HeaderList headers,
-                                       bool end_stream);
+                                       bool end_stream,
+                                       std::optional<std::uint64_t> content_length = std::nullopt);
 
     bool usable() const noexcept
     {
@@ -233,7 +249,7 @@ public:
 
 private:
     H2Connection(EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority,
-                 std::string scheme);
+                 std::string scheme, WireMode mode);
 
     Task<void> reader_loop();
     Task<void> writer_loop();
@@ -259,11 +275,13 @@ private:
     std::unique_ptr<Transport> transport_;
     std::string authority_;
     std::string scheme_;
+    WireMode mode_ = WireMode::Http2;
 
     FrameParser parser_;
     HpackDecoder decoder_;
     HpackEncoder encoder_;
 
+    std::string native_head_scratch_;
     std::string read_buffer_;
     std::string write_buffer_;
     std::string out_buffer_;

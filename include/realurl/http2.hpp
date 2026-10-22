@@ -12,7 +12,9 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -24,9 +26,16 @@ namespace realurl
 using Header = detail::h2::HeaderField;
 using Headers = detail::h2::HeaderList;
 
+/// Wire protocol selected for a client connection.
+enum class Protocol { Auto, Http2, Native };
+
 struct ResponseHead {
     int status = 0;
     Headers headers;
+    /// Negotiated wire protocol; Auto means unknown.
+    Protocol protocol = Protocol::Auto;
+    /// Response body length when known. Zero-length bodies are value 0.
+    std::optional<std::uint64_t> content_length;
 };
 
 struct Response {
@@ -46,6 +55,10 @@ struct Config {
     int max_streams_per_conn = 100;
     std::chrono::milliseconds connect_timeout{ 5000 };
     std::chrono::milliseconds idle_timeout{ 60000 };
+
+    /// Auto prefers the realurl native transport and falls back to HTTP/2.
+    /// Http2 disables native negotiation entirely. Native requires it.
+    Protocol protocol = Protocol::Auto;
 };
 
 namespace detail

@@ -65,6 +65,10 @@ public:
     void goaway(std::uint32_t last_stream_id, ErrorCode code, std::string_view debug = {});
     void window_update(std::uint32_t stream_id, std::uint32_t increment);
 
+    /// Extension frame used by the native transport (NATIVE_HELLO).
+    void extension(std::uint8_t type, std::uint32_t stream_id, std::uint8_t flags,
+                   std::string_view payload);
+
     std::string &buffer() noexcept
     {
         return buffer_;

@@ -120,6 +120,7 @@ int main()
 
     realurl::Config config;
     config.ca_file = REALURL_CERT_DIR "/localhost.pem";
+    config.protocol = realurl::Protocol::Http2;
     config.max_conns_per_origin = 1;
     config.max_streams_per_conn = 32;
 
@@ -129,6 +130,7 @@ int main()
         const realurl::Response response = realurl::sync_wait(group.get(url));
         CHECK(response.head.status == 200);
         CHECK(response.body == "secure");
+        CHECK(response.head.protocol == realurl::Protocol::Http2);
     } catch (const std::exception &error) {
         std::fprintf(stderr, "tls h2 failed: %s\n", error.what());
         CHECK(false);

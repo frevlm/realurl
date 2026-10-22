@@ -311,7 +311,7 @@ realurl::Task<void> h2_server_bench_worker(H2ServerBenchState state)
     co_return;
 }
 
-int run_h2_server_unary(int total, int concurrency, int workers)
+int run_h2_server_unary(int total, int concurrency, int workers, realurl::Protocol protocol)
 {
     total = std::max(1, total);
     concurrency = std::max(1, concurrency);
@@ -338,6 +338,7 @@ int run_h2_server_unary(int total, int concurrency, int workers)
     }
 
     realurl::Config config;
+    config.protocol = protocol;
     config.max_conns_per_origin = 1;
     config.max_streams_per_conn = concurrency;
     realurl::ClientGroup group(static_cast<unsigned>(workers), config);
@@ -375,7 +376,8 @@ int run_h2_server_unary(int total, int concurrency, int workers)
     const std::vector<double> pct = percentiles(latencies);
     const int failed = failures.load(std::memory_order_relaxed);
 
-    std::printf("mode=h2_unary requests=%d concurrency=%d workers=%d\n", total, concurrency, workers);
+    std::printf("mode=h2_unary protocol=%s requests=%d concurrency=%d workers=%d\n",
+                protocol == realurl::Protocol::Native ? "native" : "h2", total, concurrency, workers);
     std::printf("  status: %d ok, %d failed in %.2fs (%.0f req/s)\n", total - failed, failed, wall,
                 total / wall);
     if (!pct.empty())
@@ -387,7 +389,13 @@ int run_h2_server_unary(int total, int concurrency, int workers)
                 cpu_total * 1000.0 / total);
     std::printf("  rss: before=%.1fMB peak=%.1fMB current=%.1fMB\n", megabytes(rss_before),
                 megabytes(bench::peak_rss_bytes()), megabytes(bench::current_rss_bytes()));
+    const auto stats = server.stats();
+    std::printf("  connections: native=%llu h2=%llu h1=%llu\n",
+                static_cast<unsigned long long>(stats.native_connections),
+                static_cast<unsigned long long>(stats.h2_connections),
+                static_cast<unsigned long long>(stats.h1_connections));
 
+    group.close();
     server.stop();
     listener.join();
     return failed == 0 ? 0 : 1;
@@ -790,6 +798,154 @@ int free_port()
     const int port = ntohs(address.sin_port);
     ::close(fd);
     return port;
+}
+
+/// Same workload as run_llm(), but the endpoint is a realurl Server so both
+/// the HTTP/2 and native transports can be compared against identical server
+/// code. The server streams 1 KiB over duration_seconds chunks.
+int run_server_llm(int total, int concurrency, int duration_seconds, bool streaming, int connections,
+                   realurl::Protocol protocol)
+{
+    total = std::max(1, total);
+    concurrency = std::max(1, concurrency);
+    connections = std::max(1, connections);
+    duration_seconds = std::max(0, duration_seconds);
+
+    const int port = free_port();
+    if (port <= 0) {
+        std::fprintf(stderr, "native_llm: cannot reserve a local port\n");
+        return 1;
+    }
+
+    realurl::Server server;
+    server.set_io_threads(1);
+    server.set_payload_max_length(4 * 1024 * 1024);
+    server.set_read_header_timeout(0ms);
+    server.set_client_write_timeout(std::chrono::seconds(duration_seconds + 60));
+
+    server.Get("/llm", [](const auto &, auto &response) { response.set_content("ok"); });
+    server.Post("/llm", [duration_seconds, streaming](const realurl::Server::Request &request,
+                                                       realurl::Server::Response &response) {
+        response.take_over_task([duration_seconds, streaming, &request](
+                                    realurl::server::StreamWriter &writer) -> realurl::Task<void> {
+            const realurl::server::Header headers[] = { { "content-type", "text/plain" } };
+            co_await writer.write_head(200, headers, std::nullopt);
+
+            if (streaming && duration_seconds > 0) {
+                constexpr std::size_t kBody = 1024;
+                const std::string body(kBody, 'T');
+                std::size_t offset = 0;
+                for (int i = 0; i < duration_seconds; ++i) {
+                    const std::size_t remaining = kBody - offset;
+                    const std::size_t chunk =
+                        (i + 1 == duration_seconds)
+                            ? remaining
+                            : std::max<std::size_t>(1, kBody / static_cast<std::size_t>(duration_seconds));
+                    const std::size_t n = std::min(chunk, remaining);
+                    co_await writer.write(std::string_view{ body }.substr(offset, n));
+                    offset += n;
+                    if (i + 1 < duration_seconds)
+                        co_await request.loop->sleep_for(1000ms);
+                }
+            } else {
+                if (duration_seconds > 0)
+                    co_await request.loop->sleep_for(std::chrono::seconds(duration_seconds));
+                co_await writer.write(std::string(1024, 'T'));
+            }
+            co_await writer.end();
+        });
+    });
+
+    std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
+    for (int i = 0; i < 1000 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(1ms);
+    if (!server.is_running()) {
+        server.stop();
+        listener.join();
+        std::fprintf(stderr, "native_llm: server failed to start\n");
+        return 1;
+    }
+
+    realurl::EventLoop loop;
+    realurl::Config config;
+    config.protocol = protocol;
+    config.max_conns_per_origin = connections;
+    config.max_streams_per_conn = (concurrency + connections - 1) / connections;
+    realurl::Client client(loop, config);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/llm";
+    const std::string prompt_2mb(2 * 1024 * 1024, 'P');
+
+    std::atomic<int> remaining{ total };
+    std::atomic<int> completed{ 0 };
+    std::vector<double> latencies_total_ms;
+    latencies_total_ms.reserve(static_cast<std::size_t>(total));
+    std::vector<double> latencies_ttft_ms;
+    latencies_ttft_ms.reserve(static_cast<std::size_t>(total));
+    std::atomic<std::uint64_t> total_uploaded{ 0 };
+    std::atomic<std::uint64_t> total_downloaded{ 0 };
+    std::atomic<int> failed_count{ 0 };
+
+    std::chrono::steady_clock::time_point wall_start{};
+    bench::CpuTime cpu_start{};
+    const std::uint64_t rss_before = bench::current_rss_bytes();
+
+    auto driver = [&]() -> realurl::Task<void> {
+        (void)co_await client.get(url, 30s);
+        wall_start = std::chrono::steady_clock::now();
+        cpu_start = bench::cpu_time();
+
+        for (int i = 0; i < concurrency; ++i) {
+            loop.spawn(llm_worker(client, url, prompt_2mb, total, remaining, completed,
+                                  latencies_total_ms, latencies_ttft_ms, total_uploaded,
+                                  total_downloaded, failed_count, loop));
+        }
+        co_return;
+    };
+
+    loop.spawn(driver());
+    loop.run();
+
+    const double wall =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+    const bench::CpuTime cpu_end = bench::cpu_time();
+    const std::uint64_t rss_after = bench::current_rss_bytes();
+    const std::vector<double> pct_ttft = percentiles(std::move(latencies_ttft_ms));
+    const std::vector<double> pct_total = percentiles(std::move(latencies_total_ms));
+
+    const auto stats = server.stats();
+    std::printf("mode=native_llm protocol=%s requests=%d concurrency=%d duration=%ds streaming=%s "
+                "connections=%llu\n",
+                protocol == realurl::Protocol::Native ? "native" : "h2", total, concurrency,
+                duration_seconds, streaming ? "true" : "false",
+                static_cast<unsigned long long>(stats.native_connections + stats.h2_connections));
+    std::printf("  status: %d passed, %d failed in %.2fs (%.2f req/s, %.1f RPM)\n",
+                total - failed_count.load(), failed_count.load(), wall, total / wall,
+                (total / wall) * 60.0);
+    std::printf("  data: %.1f MB uploaded (%.1f MB/s), %.1f KB downloaded\n",
+                total_uploaded.load() / (1024.0 * 1024.0),
+                (total_uploaded.load() / (1024.0 * 1024.0)) / wall,
+                total_downloaded.load() / 1024.0);
+    if (!pct_ttft.empty())
+        std::printf("  ttft ms:   p50=%.1f p90=%.1f p95=%.1f p99=%.1f max=%.1f\n", pct_ttft[0],
+                    pct_ttft[1], pct_ttft[2], pct_ttft[3], pct_ttft[5]);
+    if (!pct_total.empty())
+        std::printf("  total s:   p50=%.2f p90=%.2f p95=%.2f p99=%.2f max=%.2f\n",
+                    pct_total[0] / 1000.0, pct_total[1] / 1000.0, pct_total[2] / 1000.0,
+                    pct_total[3] / 1000.0, pct_total[5] / 1000.0);
+    std::printf("  cpu: user=%.2fs sys=%.2fs total=%.2fs (%.3f ms/req)\n",
+                cpu_end.user - cpu_start.user, cpu_end.system - cpu_start.system,
+                cpu_end.total() - cpu_start.total(),
+                (cpu_end.total() - cpu_start.total()) * 1000.0 / total);
+    std::printf("  rss: before=%.1fMB peak=%.1fMB after=%.1fMB delta=%.1fMB per-inflight=%.2fMB\n",
+                megabytes(rss_before), megabytes(bench::peak_rss_bytes()), megabytes(rss_after),
+                megabytes(bench::peak_rss_bytes() - rss_before),
+                (concurrency > 0) ? megabytes(bench::peak_rss_bytes() - rss_before) / concurrency
+                                  : 0.0);
+
+    client.close();
+    server.stop();
+    listener.join();
+    return failed_count.load() == 0 ? 0 : 1;
 }
 
 struct PumpClientResult {
@@ -1587,11 +1743,14 @@ int main(int argc, char **argv)
         const int threads = argc > 4 ? std::atoi(argv[4]) : concurrency;
         return run_h1_server_unary(total, concurrency, threads);
     }
-    if (mode == "h2_unary") {
+    if (mode == "h2_unary" || mode == "native_unary") {
         const int total = argc > 2 ? std::atoi(argv[2]) : 20000;
         const int concurrency = argc > 3 ? std::atoi(argv[3]) : 100;
         const int workers = argc > 4 ? std::atoi(argv[4]) : 1;
-        return run_h2_server_unary(total, concurrency, workers);
+        const bool native = mode == "native_unary" ||
+                            (argc > 5 && (std::string(argv[5]) == "native" || std::string(argv[5]) == "1"));
+        return run_h2_server_unary(total, concurrency, workers,
+                                   native ? realurl::Protocol::Native : realurl::Protocol::Http2);
     }
     if (mode == "hold") {
         const int streams = argc > 2 ? std::atoi(argv[2]) : 1000;
@@ -1604,6 +1763,18 @@ int main(int argc, char **argv)
         const bool streaming = argc > 5 ? (std::string(argv[5]) == "1" || std::string(argv[5]) == "true") : false;
         const int connections = argc > 6 ? std::atoi(argv[6]) : 1;
         return run_llm(total, concurrency, duration, streaming, connections);
+    }
+    if (mode == "native_llm") {
+        const int total = argc > 2 ? std::atoi(argv[2]) : 10;
+        const int concurrency = argc > 3 ? std::atoi(argv[3]) : total;
+        const int duration = argc > 4 ? std::atoi(argv[4]) : 20;
+        const bool streaming =
+            argc > 5 ? (std::string(argv[5]) == "1" || std::string(argv[5]) == "true") : false;
+        const int connections = argc > 6 ? std::atoi(argv[6]) : 1;
+        const bool native =
+            argc > 7 ? (std::string(argv[7]) == "native" || std::string(argv[7]) == "1") : true;
+        return run_server_llm(total, concurrency, duration, streaming, connections,
+                              native ? realurl::Protocol::Native : realurl::Protocol::Http2);
     }
     if (mode == "pump" || mode == "async") {
         const int concurrency = argc > 2 ? std::atoi(argv[2]) : 128;
@@ -1638,7 +1809,8 @@ int main(int argc, char **argv)
 
     std::fprintf(stderr,
                  "usage: %s requests <N> <concurrency> [connections] | requests_mt <N> <concurrency> <workers> "
-                 "[connections] | h2_unary <N> <concurrency> <workers> | hold <streams> | llm <total> <concurrency> [duration_s] [streaming] [connections] "
+                 "[connections] | h2_unary|native_unary <N> <concurrency> <workers> [h2|native] | hold <streams> | llm <total> <concurrency> [duration_s] [streaming] [connections] "
+                 "| native_llm <total> <concurrency> [duration_s] [streaming] [connections] [h2|native] "
                  "| pump <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| async <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| proxy <concurrency> [chunks] [interval_ms] [timeout_ms] [workers] [bridge|block] "

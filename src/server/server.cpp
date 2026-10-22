@@ -20,6 +20,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -47,6 +48,10 @@ using detail::TcpStream;
 using detail::TlsServerContext;
 using detail::TlsServerStream;
 using detail::Transport;
+using detail::WireMode;
+using detail::kH2Preface;
+using detail::kNativeAlpn;
+using detail::kNativePreface;
 using detail::run_h2_server;
 using server::AsyncClientWriter;
 using server::BodyMode;
@@ -257,6 +262,23 @@ struct Server::Impl
 namespace
 {
 
+Task<bool> read_exact(Transport &transport, std::span<char> buffer, std::chrono::milliseconds timeout)
+{
+    std::size_t offset = 0;
+    while (offset < buffer.size()) {
+        std::size_t n = 0;
+        try {
+            n = co_await transport.read(buffer.subspan(offset), timeout);
+        } catch (...) {
+            co_return false;
+        }
+        if (n == 0)
+            co_return false;
+        offset += n;
+    }
+    co_return true;
+}
+
 Task<void> handle_client(Server::Impl *impl, EventLoop &loop, int fd, sockaddr_storage peer,
                          Client *client)
 {
@@ -282,39 +304,103 @@ Task<void> handle_client(Server::Impl *impl, EventLoop &loop, int fd, sockaddr_s
         transport = std::make_unique<TcpStream>(std::move(socket));
     }
 
-    std::string initial;
-    static constexpr std::string_view kH2Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const std::string_view alpn = transport->alpn();
+    WireMode mode = WireMode::Http2;
+    bool mode_known = false;
+    bool http1 = false;
 
-    char magic[24] = {};
-    std::size_t magic_length = 0;
-    bool h2 = true;
-    while (magic_length < kH2Preface.size()) {
+    if (!alpn.empty()) {
+        if (alpn == kNativeAlpn && impl->context.native_enabled) {
+            mode = WireMode::Native;
+            mode_known = true;
+        } else if (alpn == "h2") {
+            mode = WireMode::Http2;
+            mode_known = true;
+        } else if (alpn == "http/1.1") {
+            http1 = true;
+            mode_known = true;
+        } else {
+            co_return;
+        }
+    }
+
+    if (http1) {
+        impl->context.h1_connections.fetch_add(1, std::memory_order_relaxed);
+        H1Connection connection(impl->context, loop, std::move(transport), {}, peer.ss_family, peer,
+                                client);
+        co_await connection.run();
+        co_return;
+    }
+
+    if (mode_known) {
+        const std::string_view expected = mode == WireMode::Native ? kNativePreface : kH2Preface;
+        std::string initial(expected.size(), '\0');
+        if (!(co_await read_exact(*transport, { initial.data(), initial.size() }, 5s)) ||
+            std::string_view{ initial } != expected) {
+            co_return;
+        }
+
+        if (mode == WireMode::Native) {
+            impl->context.native_connections.fetch_add(1, std::memory_order_relaxed);
+            co_await run_h2_server(impl->context, loop, std::move(transport), peer, client,
+                                   WireMode::Native);
+        } else {
+            impl->context.h2_connections.fetch_add(1, std::memory_order_relaxed);
+            co_await run_h2_server(impl->context, loop, std::move(transport), peer, client,
+                                   WireMode::Http2);
+        }
+        co_return;
+    }
+
+    // Plaintext (or TLS without ALPN): the native preface is 11 bytes, so read
+    // that much first and decide between native, h2 and HTTP/1.1.
+    char prefix[11] = {};
+    std::size_t prefix_length = 0;
+    bool failed = false;
+    while (prefix_length < sizeof(prefix)) {
         std::size_t n = 0;
-        bool failed = false;
         try {
-            n = co_await transport->read({ magic + magic_length, kH2Preface.size() - magic_length }, 5s);
+            n = co_await transport->read(
+                { prefix + prefix_length, sizeof(prefix) - prefix_length }, 5s);
         } catch (...) {
             failed = true;
-        }
-        if (failed || n == 0) {
-            h2 = false;
             break;
         }
-        magic_length += n;
-        if (std::string_view{ magic, magic_length } != kH2Preface.substr(0, magic_length)) {
-            h2 = false;
+        if (n == 0) {
+            failed = true;
             break;
         }
+        prefix_length += n;
     }
-    initial.assign(magic, magic_length);
 
-    if (h2) {
-        co_await run_h2_server(impl->context, loop, std::move(transport), peer, client);
-    } else {
-        H1Connection connection(impl->context, loop, std::move(transport), std::move(initial),
-                                peer.ss_family, peer, client);
-        co_await connection.run();
+    std::string initial(prefix, prefix_length);
+
+    if (!failed && prefix_length == sizeof(prefix) &&
+        std::string_view{ prefix, sizeof(prefix) } == kNativePreface &&
+        impl->context.native_enabled) {
+        impl->context.native_connections.fetch_add(1, std::memory_order_relaxed);
+        co_await run_h2_server(impl->context, loop, std::move(transport), peer, client,
+                               WireMode::Native);
+        co_return;
     }
+
+    if (!failed && std::string_view{ prefix, prefix_length } == kH2Preface.substr(0, prefix_length)) {
+        std::string rest(kH2Preface.size() - prefix_length, '\0');
+        if (co_await read_exact(*transport, { rest.data(), rest.size() }, 5s)) {
+            initial.append(rest);
+            if (initial == kH2Preface) {
+                impl->context.h2_connections.fetch_add(1, std::memory_order_relaxed);
+                co_await run_h2_server(impl->context, loop, std::move(transport), peer, client,
+                                       WireMode::Http2);
+                co_return;
+            }
+        }
+    }
+
+    impl->context.h1_connections.fetch_add(1, std::memory_order_relaxed);
+    H1Connection connection(impl->context, loop, std::move(transport), std::move(initial),
+                            peer.ss_family, peer, client);
+    co_await connection.run();
 }
 
 Task<void> accept_loop(Server::Impl *impl, EventLoop &loop, TcpListener &listener, Client *client)
@@ -420,8 +506,8 @@ bool Server::Impl::start()
 
     if (!context.tls_cert.empty()) {
         try {
-            context.tls_context =
-                TlsServerContext::create(context.tls_cert, context.tls_key, context.ktls);
+            context.tls_context = TlsServerContext::create(context.tls_cert, context.tls_key,
+                                                           context.ktls, context.native_enabled);
         } catch (const std::exception &error) {
             std::fprintf(stderr, "realurl::Server: TLS setup failed: %s\n", error.what());
             listen_failed.store(true, std::memory_order_release);
@@ -535,6 +621,9 @@ Server::Stats Server::Impl::stats() const
     result.errors = context.errors.load(std::memory_order_relaxed);
     result.bytes_in = context.bytes_in.load(std::memory_order_relaxed);
     result.bytes_out = context.bytes_out.load(std::memory_order_relaxed);
+    result.h1_connections = context.h1_connections.load(std::memory_order_relaxed);
+    result.h2_connections = context.h2_connections.load(std::memory_order_relaxed);
+    result.native_connections = context.native_connections.load(std::memory_order_relaxed);
 
     for (const auto &worker : workers) {
         if (worker != nullptr && worker->loop != nullptr) {
@@ -810,6 +899,12 @@ Server &Server::set_upstream(Config config)
 {
     impl_->context.has_upstream = true;
     impl_->context.upstream_config = std::move(config);
+    return *this;
+}
+
+Server &Server::set_native(bool enabled)
+{
+    impl_->context.native_enabled = enabled;
     return *this;
 }
 

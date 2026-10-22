@@ -1,5 +1,7 @@
 #include "realurl/detail/tls.hpp"
 
+#include "realurl/detail/protocol.hpp"
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
@@ -48,7 +50,7 @@ private:
 
 } // namespace
 
-std::shared_ptr<TlsContext> TlsContext::create(std::string_view ca_file)
+std::shared_ptr<TlsContext> TlsContext::create(std::string_view ca_file, bool offer_native)
 {
     static std::once_flag once;
     std::call_once(once, [] { SSL_library_init(); });
@@ -69,9 +71,15 @@ std::shared_ptr<TlsContext> TlsContext::create(std::string_view ca_file)
         SSL_CTX_set_default_verify_paths(ctx);
     }
 
-    // Client: only h2.
-    static const unsigned char kAlpnProtocols[] = { 2, 'h', '2' };
-    SSL_CTX_set_alpn_protos(ctx, kAlpnProtocols, sizeof(kAlpnProtocols));
+    if (offer_native) {
+        static const unsigned char kAlpnNative[] = {
+            9, 'r', 'e', 'a', 'l', 'u', 'r', 'l', '/', '1', 2, 'h', '2',
+        };
+        SSL_CTX_set_alpn_protos(ctx, kAlpnNative, sizeof(kAlpnNative));
+    } else {
+        static const unsigned char kAlpnH2[] = { 2, 'h', '2' };
+        SSL_CTX_set_alpn_protos(ctx, kAlpnH2, sizeof(kAlpnH2));
+    }
 
     return std::shared_ptr<TlsContext>(new TlsContext(ctx));
 }
@@ -82,9 +90,10 @@ TlsContext::~TlsContext()
         SSL_CTX_free(ctx_);
 }
 
-TlsStream::TlsStream(TcpStream socket, SSL *ssl)
+TlsStream::TlsStream(TcpStream socket, SSL *ssl, std::string alpn)
     : socket_(std::move(socket))
     , ssl_(ssl)
+    , alpn_(std::move(alpn))
 {
 }
 
@@ -135,13 +144,15 @@ Task<std::unique_ptr<Transport>> TlsStream::connect(EventLoop &loop, const Socke
     const unsigned char *selected = nullptr;
     unsigned int selected_len = 0;
     SSL_get0_alpn_selected(ssl, &selected, &selected_len);
-    const bool h2 = selected != nullptr && selected_len == 2 && selected[0] == 'h' && selected[1] == '2';
-    if (!h2) {
+    std::string alpn;
+    if (selected != nullptr && selected_len != 0)
+        alpn.assign(reinterpret_cast<const char *>(selected), selected_len);
+    if (alpn != kNativeAlpn && alpn != "h2") {
         SSL_free(ssl);
-        throw std::runtime_error("TLS server did not negotiate h2");
+        throw std::runtime_error("TLS server did not negotiate realurl/1 or h2");
     }
 
-    co_return std::unique_ptr<Transport>(new TlsStream(std::move(socket), ssl));
+    co_return std::unique_ptr<Transport>(new TlsStream(std::move(socket), ssl, std::move(alpn)));
 }
 
 Task<std::size_t> TlsStream::read(std::span<char> buffer, std::chrono::milliseconds idle)

@@ -190,6 +190,7 @@ void test_streaming_proxy()
     Server server;
     server.set_io_threads(1);
     realurl::Config config;
+    config.protocol = realurl::Protocol::Http2;
     config.max_conns_per_origin = 1;
     config.max_streams_per_conn = 64;
     server.set_upstream(config);
@@ -230,6 +231,7 @@ void test_upload_proxy()
     server.set_io_threads(1);
     server.set_payload_max_length(4 * 1024 * 1024);
     realurl::Config config;
+    config.protocol = realurl::Protocol::Http2;
     config.max_conns_per_origin = 1;
     config.max_streams_per_conn = 64;
     server.set_upstream(config);

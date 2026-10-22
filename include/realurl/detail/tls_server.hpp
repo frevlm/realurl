@@ -27,7 +27,7 @@ using ServerSSL = ::ssl_st;
 class TlsServerContext {
 public:
     static std::shared_ptr<TlsServerContext> create(std::string cert_file, std::string key_file,
-                                                    bool enable_ktls);
+                                                    bool enable_ktls, bool native_enabled);
     ~TlsServerContext();
 
     TlsServerContext(const TlsServerContext &) = delete;
@@ -44,14 +44,16 @@ public:
     }
 
 private:
-    TlsServerContext(ServerSSL_CTX *ctx, bool ktls_requested) noexcept
+    TlsServerContext(ServerSSL_CTX *ctx, bool ktls_requested, bool native_enabled) noexcept
         : ctx_(ctx)
         , ktls_requested_(ktls_requested)
+        , native_enabled_(native_enabled)
     {
     }
 
     ServerSSL_CTX *ctx_;
     bool ktls_requested_ = false;
+    bool native_enabled_ = true;
 };
 
 class TlsServerStream final : public Transport {
@@ -73,7 +75,7 @@ public:
 
     void close() noexcept override;
 
-    std::string_view alpn() const noexcept
+    std::string_view alpn() const noexcept override
     {
         return alpn_;
     }

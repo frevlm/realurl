@@ -67,6 +67,7 @@ add_library(realurl_core
   src/detail/resolver.cpp
   src/detail/frame.cpp
   src/detail/hpack.cpp
+  src/detail/native_codec.cpp
   src/detail/url.cpp
   src/detail/connection.cpp
   src/detail/client.cpp

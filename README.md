@@ -6,7 +6,11 @@ and task scheduling. OpenSSL 3.x is the only dependency delegated to a library.
 
 realurl is the networking layer extracted from [revlm](https://github.com/FlowerRealm/revlm).
 It provides an HTTP/2 client (the original 0.3 core) and, in 0.4, an HTTP/1.1 +
-HTTP/2 server with an in-loop streaming proxy. HTTP/3 is not supported.
+HTTP/2 server with an in-loop streaming proxy. In 0.5, two realurl peers can
+negotiate a native transport (`realurl/1`) that keeps the HTTP/2 framing,
+streams and flow control but replaces HPACK with a compact binary head codec;
+peers that do not support it automatically use HTTP/2. HTTP/3 is not
+supported.
 
 ## Public API
 
@@ -37,9 +41,15 @@ loop.run();
 ```
 
 That is the whole surface: `Client`, `ClientGroup`, `Stream`, `Response`,
-`Header`, `Config`, `Task`, `EventLoop`. No connection handles, no session
-objects, no request builders. A `Stream` is move-only; destroying one without
-`end()`/`cancel()` sends RST_STREAM.
+`Header`, `Config`, `Task`, `EventLoop`, and the `Protocol` enum. No connection
+handles, no session objects, no request builders. A `Stream` is move-only;
+destroying one without `end()`/`cancel()` sends RST_STREAM.
+
+`Config::protocol` selects the wire transport. The default, `Protocol::Auto`,
+prefers the realurl native transport and silently falls back to HTTP/2;
+`Protocol::Http2` disables native negotiation, and `Protocol::Native` requires
+it. `ResponseHead::protocol` reports what was negotiated and
+`ResponseHead::content_length` carries the body length when known.
 
 `ClientGroup` runs N loop/client pairs on N threads and spreads work across
 them. Tasks run on a worker loop use that worker's client directly (no
@@ -78,10 +88,11 @@ Rules:
 | Coroutine core | `detail/task.hpp`, `detail/coro_pool.hpp` | `Task<T>`, symmetric transfer, `sync_wait`, per-thread frame cache |
 | Event loop | `detail/event_loop.hpp`, `src/detail/poller_{epoll,kqueue}.cpp` | epoll on Linux, kqueue on macOS, edge-triggered persistent registration, timer heap |
 | Sockets | `detail/socket.hpp` | Non-blocking connect/read/write, listener, resolver |
-| TLS | `detail/tls.cpp`, OpenSSL 3.x | TLS 1.2/1.3, ALPN (h2/http1.1), SNI, session tickets, kTLS hooks |
-| Server | `realurl/server.hpp`, `src/server/*` | H1 + H2 on the EventLoop, keep-alive, coroutine takeover, in-loop proxy |
+| TLS | `detail/tls.cpp`, OpenSSL 3.x | TLS 1.2/1.3, ALPN (realurl/1, h2, http1.1), SNI, session tickets, kTLS hooks |
+| Server | `realurl/server.hpp`, `src/server/*` | H1 + H2 + native on the EventLoop, keep-alive, coroutine takeover, in-loop proxy |
 | io_uring | `detail/uring*.cpp` | multishot recv + provided buffers, Linux only, `REALURL_WITH_IO_URING` |
 | HTTP/2 | `detail/frame.hpp`, `detail/hpack.hpp`, `detail/connection.hpp` | Full HPACK (Huffman + dynamic table), flow control, GOAWAY/PING/RST |
+| Native codec | `detail/native_codec.hpp`, `detail/protocol.hpp` | `realurl/1` head blocks, ALPN/preface negotiation, native response heads |
 | Client | `realurl/http2.hpp`, `detail/client.hpp`, `detail/client_group.cpp` | Pool per origin with coalesced connection attempts, sharded `ClientGroup` |
 
 
@@ -135,6 +146,13 @@ measured numbers. The short version:
 - **HPACK is the correctness single point.** The decoder passes the RFC 7541
   C.3/C.4/C.6 example suites and is cross-checked against Go's `net/http` in
   the interop tests.
+- **Native transport reuses the engine.** `realurl/1` runs on the same frame
+  header, stream state, flow control and writer, and swaps only the
+  HEADERS/CONTINUATION codec: a compact binary block with a static name table
+  instead of HPACK. Native peers are found by TLS ALPN or the
+  `REALURL/1\r\n` preface; a plaintext `Auto` client probes native and falls
+  back to h2c once per origin. See `docs/native.md` and the A/B numbers in
+  `docs/performance.md`.
 
 ## License
 

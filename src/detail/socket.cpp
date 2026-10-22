@@ -28,18 +28,30 @@ constexpr int kSendFlags = 0;
     throw std::system_error(errno, std::generic_category(), what);
 }
 
+void set_nosigpipe(int fd) noexcept
+{
+#ifdef SO_NOSIGPIPE
+    const int on = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+    (void)fd;
+#endif
+}
+
 int accept_nonblocking(int fd, sockaddr *address, socklen_t *length)
 {
 #ifdef __linux__
-    return ::accept4(fd, address, length, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    const int client = ::accept4(fd, address, length, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #else
     const int client = ::accept(fd, address, length);
     if (client >= 0) {
         set_nonblocking(client);
         set_cloexec(client);
     }
-    return client;
 #endif
+    if (client >= 0)
+        set_nosigpipe(client);
+    return client;
 }
 
 int bind_listener(const ListenerOptions &options, std::uint16_t &port, int &family)
@@ -249,6 +261,8 @@ TcpStream::TcpStream(EventLoop &loop, int fd) noexcept
     : loop_(&loop)
     , fd_(fd)
 {
+    if (fd_ >= 0)
+        set_nosigpipe(fd_);
     register_io();
 }
 
@@ -411,6 +425,7 @@ Task<TcpStream> TcpStream::connect(EventLoop &loop, const sockaddr *address, soc
 
     set_nonblocking(fd);
     set_cloexec(fd);
+    set_nosigpipe(fd);
 
     TcpStream stream(loop, fd);
 

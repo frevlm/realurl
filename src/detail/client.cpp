@@ -66,7 +66,7 @@ public:
         : loop_(&loop)
         , config_(std::move(config))
         , resolver_(loop)
-        , tls_context_(TlsContext::create(config_.ca_file))
+        , tls_context_(TlsContext::create(config_.ca_file, config_.protocol != Protocol::Http2))
     {
     }
 
@@ -121,7 +121,7 @@ public:
 
         std::shared_ptr<H2Connection> conn;
         try {
-            conn = co_await dial(url, timeout);
+            conn = co_await dial(url, timeout, *pool);
         } catch (...) {
             finish_attempt(*pool, nullptr, std::current_exception());
             throw;
@@ -151,6 +151,8 @@ private:
         std::vector<std::coroutine_handle<>> waiters;
         std::exception_ptr last_error;
         bool connecting = false;
+        WireMode wire_mode = WireMode::Http2;
+        bool wire_mode_known = false;
     };
 
     static std::string origin_key(const UrlParts &url)
@@ -183,32 +185,74 @@ private:
             loop_->resume_later(handle);
     }
 
-    Task<std::shared_ptr<H2Connection>> dial(const UrlParts &url, std::chrono::milliseconds timeout)
+    Task<std::shared_ptr<H2Connection>> dial(const UrlParts &url, std::chrono::milliseconds timeout,
+                                             OriginPool &pool)
     {
         const std::string connect_host = config_.pinned_ip.empty() ? url.host : config_.pinned_ip;
 
         std::chrono::milliseconds connect_timeout = config_.connect_timeout;
         if (timeout.count() > 0)
             connect_timeout = std::min(timeout, config_.connect_timeout);
+        const auto probe_timeout = std::min(connect_timeout, std::chrono::milliseconds{ 1000 });
 
-        const SocketAddress address = co_await resolver_.resolve(connect_host, url.port);
+        for (;;) {
+            const SocketAddress address = co_await resolver_.resolve(connect_host, url.port);
 
-        std::unique_ptr<Transport> transport;
-        if (url.tls) {
-            transport = co_await TlsStream::connect(*loop_, address, url.host, tls_context_, connect_timeout);
-        } else {
-            TcpStream socket =
-                co_await TcpStream::connect(*loop_, reinterpret_cast<const sockaddr *>(&address.storage),
-                                            address.length, connect_timeout);
+            std::unique_ptr<Transport> transport;
+            WireMode mode = WireMode::Http2;
+            bool probe = false;
+
+            if (url.tls) {
+                transport = co_await TlsStream::connect(*loop_, address, url.host, tls_context_, connect_timeout);
+                const std::string_view alpn = transport->alpn();
+                if (alpn == kNativeAlpn) {
+                    mode = WireMode::Native;
+                } else if (alpn == "h2") {
+                    mode = WireMode::Http2;
+                } else {
+                    throw std::runtime_error("TLS server did not negotiate a supported protocol");
+                }
+                if (config_.protocol == Protocol::Native && mode != WireMode::Native)
+                    throw std::runtime_error("realurl native transport required but the peer negotiated h2");
+                pool.wire_mode = mode;
+                pool.wire_mode_known = true;
+            } else {
+                TcpStream socket = co_await TcpStream::connect(
+                    *loop_, reinterpret_cast<const sockaddr *>(&address.storage), address.length,
+                    connect_timeout);
 #ifdef REALURL_WITH_IO_URING
-            if (loop_->uring() != nullptr)
-                transport = UringTransport::create(*loop_, socket.release());
+                if (loop_->uring() != nullptr)
+                    transport = UringTransport::create(*loop_, socket.release());
 #endif
-            if (transport == nullptr)
-                transport = std::make_unique<TcpStream>(std::move(socket));
-        }
+                if (transport == nullptr)
+                    transport = std::make_unique<TcpStream>(std::move(socket));
 
-        co_return co_await H2Connection::connect(*loop_, std::move(transport), url.authority(), url.scheme);
+                if (config_.protocol == Protocol::Http2) {
+                    mode = WireMode::Http2;
+                } else if (config_.protocol == Protocol::Native) {
+                    mode = WireMode::Native;
+                    probe = true;
+                } else if (pool.wire_mode_known) {
+                    mode = pool.wire_mode;
+                } else {
+                    mode = WireMode::Native;
+                    probe = true;
+                }
+            }
+
+            try {
+                std::shared_ptr<H2Connection> connection = co_await H2Connection::connect(
+                    *loop_, std::move(transport), url.authority(), url.scheme, mode, probe, probe_timeout);
+                pool.wire_mode = mode;
+                pool.wire_mode_known = true;
+                co_return connection;
+            } catch (const NativeUnsupported &) {
+                if (config_.protocol != Protocol::Auto)
+                    throw;
+                pool.wire_mode = WireMode::Http2;
+                pool.wire_mode_known = true;
+            }
+        }
     }
 
     EventLoop *loop_;
@@ -283,10 +327,12 @@ Task<Response> Client::request(std::string method, std::string url, Headers head
     if (method.empty())
         throw std::invalid_argument("h2 request: empty method");
     const bool has_body = !body.empty();
+    const std::uint64_t body_size = body.size();
     const detail::UrlParts parts = detail::parse_url(url);
     std::shared_ptr<detail::H2Connection> connection = co_await impl_->connection(parts, timeout);
-    std::shared_ptr<detail::H2StreamImpl> stream_impl =
-        connection->open(method, parts.path, std::move(headers), !has_body);
+    std::shared_ptr<detail::H2StreamImpl> stream_impl = connection->open(
+        method, parts.path, std::move(headers), !has_body,
+        has_body ? std::optional<std::uint64_t>(body_size) : std::nullopt);
     Stream stream(std::move(stream_impl));
 
     if (has_body) {
@@ -296,6 +342,8 @@ Task<Response> Client::request(std::string method, std::string url, Headers head
 
     Response response;
     response.head = co_await stream.head(timeout);
+    if (response.head.content_length.has_value() && *response.head.content_length <= 8 * 1024 * 1024)
+        response.body.reserve(static_cast<std::size_t>(*response.head.content_length));
 
     char buffer[16384];
     for (;;) {

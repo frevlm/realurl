@@ -1,5 +1,7 @@
 #include "realurl/detail/tls_server.hpp"
 
+#include "realurl/detail/protocol.hpp"
+
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
@@ -27,8 +29,10 @@ void describe_error(std::string &message)
 }
 
 int select_alpn(SSL *, const unsigned char **out, unsigned char *out_len,
-                const unsigned char *in, unsigned int in_len, void *)
+                const unsigned char *in, unsigned int in_len, void *arg)
 {
+    const bool native_enabled = arg == nullptr || *static_cast<bool *>(arg);
+    const unsigned char *native = nullptr;
     const unsigned char *h2 = nullptr;
     const unsigned char *http11 = nullptr;
 
@@ -36,6 +40,10 @@ int select_alpn(SSL *, const unsigned char **out, unsigned char *out_len,
         const unsigned int length = in[i++];
         if (length == 0 || i + length > in_len)
             break;
+        if (native_enabled && length == kNativeAlpn.size() &&
+            std::memcmp(in + i, kNativeAlpn.data(), kNativeAlpn.size()) == 0 && native == nullptr) {
+            native = in + i;
+        }
         if (length == 2 && in[i] == 'h' && in[i + 1] == '2' && h2 == nullptr)
             h2 = in + i;
         if (length == 8 && std::memcmp(in + i, "http/1.1", 8) == 0 && http11 == nullptr)
@@ -43,6 +51,11 @@ int select_alpn(SSL *, const unsigned char **out, unsigned char *out_len,
         i += length;
     }
 
+    if (native != nullptr) {
+        *out = native;
+        *out_len = static_cast<unsigned char>(kNativeAlpn.size());
+        return SSL_TLSEXT_ERR_OK;
+    }
     if (h2 != nullptr) {
         *out = h2;
         *out_len = 2;
@@ -59,7 +72,8 @@ int select_alpn(SSL *, const unsigned char **out, unsigned char *out_len,
 } // namespace
 
 std::shared_ptr<TlsServerContext> TlsServerContext::create(std::string cert_file,
-                                                           std::string key_file, bool enable_ktls)
+                                                           std::string key_file, bool enable_ktls,
+                                                           bool native_enabled)
 {
     static std::once_flag once;
     std::call_once(once, [] { OPENSSL_init_ssl(0, nullptr); });
@@ -77,7 +91,6 @@ std::shared_ptr<TlsServerContext> TlsServerContext::create(std::string cert_file
     }
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_alpn_select_cb(ctx, select_alpn, nullptr);
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     (void)SSL_CTX_set_cipher_list(ctx, "ECDHE+AESGCM:ECDHE+CHACHA20");
@@ -96,7 +109,10 @@ std::shared_ptr<TlsServerContext> TlsServerContext::create(std::string cert_file
     (void)enable_ktls;
 #endif
 
-    return std::shared_ptr<TlsServerContext>(new TlsServerContext(ctx, ktls_requested));
+    auto context = std::shared_ptr<TlsServerContext>(
+        new TlsServerContext(ctx, ktls_requested, native_enabled));
+    SSL_CTX_set_alpn_select_cb(ctx, select_alpn, &context->native_enabled_);
+    return context;
 }
 
 TlsServerContext::~TlsServerContext()

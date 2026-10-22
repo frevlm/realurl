@@ -53,6 +53,9 @@ public:
         std::uint64_t errors = 0;
         std::uint64_t bytes_in = 0;
         std::uint64_t bytes_out = 0;
+        std::uint64_t h1_connections = 0;
+        std::uint64_t h2_connections = 0;
+        std::uint64_t native_connections = 0;
         EventLoopStats loop;
     };
 
@@ -99,6 +102,10 @@ public:
 
     /// Enable the per-loop upstream client used by proxy handlers.
     Server &set_upstream(Config config);
+
+    /// Enable the realurl native transport (ALPN realurl/1 and the plaintext
+    /// REALURL/1 preface). Enabled by default; call before listen().
+    Server &set_native(bool enabled = true);
 
     /// Default strategy for routes that do not override it.
     Server &set_strategy(StreamStrategy strategy);

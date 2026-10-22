@@ -126,6 +126,48 @@ selection when the attempt completes. Without this, a burst of N requests
 opened N connections. `Client::close()` (also run by the destructor) sends
 GOAWAY and shuts down every socket so peers observe EOF promptly.
 
+## Native transport (realurl/1)
+
+When both ends are realurl, the connection can switch to a native head codec.
+It is not a second transport stack: the 9-byte frame header, DATA,
+CONTINUATION, SETTINGS, PING, GOAWAY, WINDOW_UPDATE, RST_STREAM, stream state,
+flow control, writer scheduling and `Transport` layer are the same objects used
+by HTTP/2. Only the HEADERS/CONTINUATION payload changes, from HPACK to a
+compact binary block:
+
+```
+tag (request/response/trailers)
+method code or literal, target
+flags + optional content-length varint
+header count, then (name code | literal, value) pairs
+```
+
+Header names use a static, case-insensitive table of common names; unknown
+names are literal. Values are raw. There is no dynamic table and no Huffman.
+The decoder produces views into the head block, so the server builds `Request`
+without per-header `std::string` allocations. `content-length` has a dedicated
+field and is mapped back to both `content_length` and a synthesized header view
+on the receiving side.
+
+Negotiation is per connection:
+
+- TLS prefers ALPN `realurl/1`, then `h2`, then `http/1.1`;
+- plaintext uses the `REALURL/1\r\n` preamble, detected before the h2 preface;
+- a native server sends a `NATIVE_HELLO` extension frame before SETTINGS;
+- a plaintext `Protocol::Auto` client probes native and validates
+  `NATIVE_HELLO`; if it sees an h2 server's SETTINGS instead it reconnects with
+  h2c and caches the result per origin.
+
+The server dispatcher reads 11 bytes, matches the native preamble, continues to
+24 bytes for the h2 preface, or hands the bytes to H1. `Server::set_native(false)`
+removes `realurl/1` from ALPN and disables the preamble match. `Server::Stats`
+counts H1, H2 and native connections.
+
+Native HEADERS blocks are bounded by 1 MiB (`set_header_limit()` can lower it)
+and 256 headers; method, target and header values reject CR/LF/NUL, and all
+varints are overflow-checked. A malformed block resets the stream; an oversized
+block closes the connection with GOAWAY.
+
 ## Server runtime
 
 `realurl::Server` runs on the same EventLoop as the client. One thread owns one

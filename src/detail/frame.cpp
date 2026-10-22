@@ -133,4 +133,11 @@ void FrameWriter::window_update(std::uint32_t stream_id, std::uint32_t increment
     append_u32(buffer_, increment & 0x7fffffffu);
 }
 
+void FrameWriter::extension(std::uint8_t type, std::uint32_t stream_id, std::uint8_t flags,
+                            std::string_view payload)
+{
+    write_header(static_cast<FrameType>(type), flags, stream_id, payload.size());
+    buffer_.append(payload);
+}
+
 } // namespace realurl::detail::h2

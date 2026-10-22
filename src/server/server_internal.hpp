@@ -3,6 +3,7 @@
 #include "http1_parser.hpp"
 #include "router.hpp"
 
+#include "realurl/detail/protocol.hpp"
 #include "realurl/detail/socket.hpp"
 #include "realurl/detail/tls_server.hpp"
 #include "realurl/server.hpp"
@@ -46,6 +47,7 @@ struct ServerContext
 
     bool path_decoding = true;
     bool keep_alive = true;
+    bool native_enabled = true;
     StreamStrategy default_strategy = StreamStrategy::Auto;
     std::size_t queue_high = 64 * 1024;
     std::size_t queue_low = 32 * 1024;
@@ -69,6 +71,9 @@ struct ServerContext
     std::atomic<std::uint64_t> errors{ 0 };
     std::atomic<std::uint64_t> bytes_in{ 0 };
     std::atomic<std::uint64_t> bytes_out{ 0 };
+    std::atomic<std::uint64_t> h1_connections{ 0 };
+    std::atomic<std::uint64_t> h2_connections{ 0 };
+    std::atomic<std::uint64_t> native_connections{ 0 };
 
     void apply_error_body(Response &response, int status) const;
     std::string error_response(int status) const;

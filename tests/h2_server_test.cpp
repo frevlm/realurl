@@ -41,7 +41,8 @@ realurl::Task<void> fetch_stream(StreamFetch fetch)
                 break;
             body.append(buffer, n);
         }
-        *fetch.ok = head.status == 200 && body == "onetwo";
+        *fetch.ok = head.status == 200 && head.protocol == realurl::Protocol::Http2 &&
+                    body == "onetwo";
     } catch (...) {
         *fetch.ok = false;
     }
@@ -122,6 +123,7 @@ void test_unary_and_streaming()
         std::this_thread::sleep_for(1ms);
 
     realurl::Config config;
+    config.protocol = realurl::Protocol::Http2;
     config.max_conns_per_origin = 1;
     config.max_streams_per_conn = 128;
     realurl::ClientGroup group(2, config);
@@ -130,6 +132,7 @@ void test_unary_and_streaming()
     const realurl::Response hello = realurl::sync_wait(group.get(base + "/hello"));
     CHECK(hello.head.status == 200);
     CHECK(hello.body == "world");
+    CHECK(hello.head.protocol == realurl::Protocol::Http2);
 
     const realurl::Response echo =
         realurl::sync_wait(group.request("POST", base + "/echo", {}, "ping"));
@@ -170,6 +173,7 @@ void test_concurrent_streams()
         std::this_thread::sleep_for(1ms);
 
     realurl::Config config;
+    config.protocol = realurl::Protocol::Http2;
     config.max_conns_per_origin = 1;
     config.max_streams_per_conn = 128;
 

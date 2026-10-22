@@ -22,6 +22,13 @@ std::string url_for(const realurl::test::H2TestServer &server, std::string_view 
     return "http://127.0.0.1:" + std::to_string(server.port()) + std::string(path);
 }
 
+realurl::Config h2_config()
+{
+    realurl::Config config;
+    config.protocol = realurl::Protocol::Http2;
+    return config;
+}
+
 /// Keeps the coroutine closure alive until run() returns. A temporary lambda
 /// passed straight to spawn() would leave the coroutine's `this` dangling.
 template <class F>
@@ -61,7 +68,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
 
         int status = 0;
         std::string body;
@@ -94,7 +101,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
 
         std::string body;
         std::string error;
@@ -124,7 +131,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
         const std::string url = url_for(server, "/warmup");
 
         const int count = 10;
@@ -162,7 +169,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
         const std::string url = url_for(server, "/duplex");
 
         int status = 0;
@@ -206,7 +213,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
         const std::string url = url_for(server, "/slow");
 
         bool timed_out = false;
@@ -233,7 +240,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
         const std::string url = url_for(server, "/large");
 
         std::size_t received = 0;
@@ -265,6 +272,7 @@ int main()
         realurl::EventLoop loop;
         realurl::Config config;
         config.ca_file = REALURL_CERT_DIR "/localhost.pem";
+        config.protocol = realurl::Protocol::Http2;
         realurl::Client client(loop, config);
         const std::string url = "https://localhost:" + std::to_string(server.port()) + "/tls";
 
@@ -292,7 +300,7 @@ int main()
 
     {
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
         bool threw = false;
         run_task(loop, [&]() -> realurl::Task<void> {
             try {
@@ -313,7 +321,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
         bool threw = false;
         const std::string url = url_for(server, "/bad-header");
         run_task(loop, [&]() -> realurl::Task<void> {
@@ -340,7 +348,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
         const std::string url = url_for(server, "/hdr");
         run_task(loop, [&]() -> realurl::Task<void> {
             try {
@@ -360,7 +368,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
         int status = 0;
         std::string body;
         run_task(loop, [&]() -> realurl::Task<void> {
@@ -385,7 +393,7 @@ int main()
         });
 
         realurl::EventLoop loop;
-        realurl::Client client(loop);
+        realurl::Client client(loop, h2_config());
         const std::string url_post = url_for(server, "/upload");
         const std::string url_get = url_for(server, "/get_after_post");
         const std::string large_body(65535, 'z');

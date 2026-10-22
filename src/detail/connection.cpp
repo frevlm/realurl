@@ -1,5 +1,7 @@
 #include "realurl/detail/connection.hpp"
 
+#include "realurl/detail/native_codec.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -36,6 +38,85 @@ bool is_connection_header(std::string_view name)
 {
     return name == "connection" || name == "keep-alive" || name == "proxy-connection" ||
            name == "transfer-encoding" || name == "upgrade";
+}
+
+bool iequals(std::string_view left, std::string_view right) noexcept
+{
+    if (left.size() != right.size())
+        return false;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        const auto a = static_cast<unsigned char>(left[i]);
+        const auto b = static_cast<unsigned char>(right[i]);
+        const auto lower = [](unsigned char c) {
+            return c >= 'A' && c <= 'Z' ? static_cast<unsigned char>(c - 'A' + 'a') : c;
+        };
+        if (lower(a) != lower(b))
+            return false;
+    }
+    return true;
+}
+
+bool parse_uint(std::string_view text, std::uint64_t &out) noexcept
+{
+    if (text.empty())
+        return false;
+    std::uint64_t value = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9')
+            return false;
+        const std::uint64_t digit = static_cast<std::uint64_t>(c - '0');
+        if (value > (UINT64_MAX - digit) / 10)
+            return false;
+        value = value * 10 + digit;
+    }
+    out = value;
+    return true;
+}
+
+Task<void> read_exact(Transport &transport, std::span<char> buffer,
+                      std::chrono::milliseconds timeout)
+{
+    std::size_t offset = 0;
+    while (offset < buffer.size()) {
+        const std::size_t n = co_await transport.read(buffer.subspan(offset), timeout);
+        if (n == 0)
+            throw NativeUnsupported();
+        offset += n;
+    }
+}
+
+Task<void> expect_native_hello(Transport &transport, std::chrono::milliseconds timeout)
+{
+    char header[9] = {};
+    try {
+        co_await read_exact(transport, { header, sizeof(header) }, timeout);
+    } catch (const std::system_error &) {
+        throw NativeUnsupported();
+    }
+
+    const auto *raw = reinterpret_cast<const unsigned char *>(header);
+    const std::uint32_t length = (static_cast<std::uint32_t>(raw[0]) << 16) |
+                                 (static_cast<std::uint32_t>(raw[1]) << 8) |
+                                 static_cast<std::uint32_t>(raw[2]);
+    const std::uint32_t stream_id = (static_cast<std::uint32_t>(raw[5]) << 24) |
+                                    (static_cast<std::uint32_t>(raw[6]) << 16) |
+                                    (static_cast<std::uint32_t>(raw[7]) << 8) |
+                                    static_cast<std::uint32_t>(raw[8]);
+    if (raw[3] != kNativeHelloType || length != kNativeHelloPayloadSize ||
+        (stream_id & 0x7fffffffu) != 0)
+        throw NativeUnsupported();
+
+    char payload[kNativeHelloPayloadSize] = {};
+    try {
+        co_await read_exact(transport, { payload, sizeof(payload) }, timeout);
+    } catch (const std::system_error &) {
+        throw NativeUnsupported();
+    }
+
+    if (std::memcmp(payload, kNativeHelloMagic.data(), kNativeHelloMagic.size()) != 0 ||
+        static_cast<unsigned char>(payload[8]) != kNativeVersionMajor ||
+        static_cast<unsigned char>(payload[9]) != kNativeVersionMinor)
+        throw NativeUnsupported();
 }
 
 } // namespace
@@ -455,7 +536,7 @@ void H2StreamImpl::cancel()
     fail(ECANCELED);
 }
 
-void H2StreamImpl::on_headers(HeaderList &&headers, bool end_stream)
+void H2StreamImpl::on_head(ResponseHead &&head, bool end_stream)
 {
     if (closed_)
         return;
@@ -463,19 +544,7 @@ void H2StreamImpl::on_headers(HeaderList &&headers, bool end_stream)
     if (head_ready_) {
         // Trailers: ignored in this version.
     } else {
-        ResponseHead result;
-        for (HeaderField &header : headers) {
-            if (header.name == ":status") {
-                try {
-                    result.status = std::stoi(header.value);
-                } catch (...) {
-                    result.status = 0;
-                }
-            } else if (!header.name.empty() && header.name[0] != ':') {
-                result.headers.push_back(std::move(header));
-            }
-        }
-        head_result_ = std::move(result);
+        head_result_ = std::move(head);
         head_ready_ = true;
         if (head_waiter_ != nullptr)
             complete_head(head_waiter_);
@@ -687,21 +756,35 @@ void H2StreamImpl::check_closed()
 }
 
 H2Connection::H2Connection(EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority,
-                                 std::string scheme)
+                           std::string scheme, WireMode mode)
     : loop_(loop)
     , transport_(std::move(transport))
     , authority_(std::move(authority))
     , scheme_(std::move(scheme))
+    , mode_(mode)
     , flush_signal_(loop)
 {
 }
 
-Task<std::shared_ptr<H2Connection>> H2Connection::connect(EventLoop &loop, std::unique_ptr<Transport> transport,
-                                                          std::string authority, std::string scheme)
+Task<std::shared_ptr<H2Connection>> H2Connection::connect(
+    EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority, std::string scheme,
+    WireMode mode, bool probe_native, std::chrono::milliseconds probe_timeout)
 {
-    std::shared_ptr<H2Connection> connection(
-        new H2Connection(loop, std::move(transport), std::move(authority), std::move(scheme)));
+    std::shared_ptr<H2Connection> connection(new H2Connection(
+        loop, std::move(transport), std::move(authority), std::move(scheme), mode));
     connection->send_preface();
+
+    if (probe_native) {
+        try {
+            co_await connection->transport_->write_all(connection->write_buffer_, probe_timeout);
+            connection->write_buffer_.clear();
+            co_await expect_native_hello(*connection->transport_, probe_timeout);
+        } catch (...) {
+            connection->transport_->close();
+            throw;
+        }
+    }
+
     loop.spawn(connection->reader_loop());
     loop.spawn(connection->writer_loop());
     co_return connection;
@@ -709,24 +792,35 @@ Task<std::shared_ptr<H2Connection>> H2Connection::connect(EventLoop &loop, std::
 
 void H2Connection::send_preface()
 {
-    write_buffer_.append("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-
-    const Setting settings[] = {
-        { kSettingEnablePush, 0 },
-        { kSettingInitialWindowSize, kStreamRecvWindow },
-        { kSettingMaxFrameSize, kDefaultMaxFrameSize },
-    };
-    FrameWriter writer;
-    writer.settings(settings);
-    write_buffer_.append(writer.buffer());
+    if (mode_ == WireMode::Native) {
+        write_buffer_.append(kNativePreface);
+        const Setting settings[] = {
+            { kSettingInitialWindowSize, kStreamRecvWindow },
+            { kSettingMaxFrameSize, kDefaultMaxFrameSize },
+        };
+        FrameWriter writer;
+        writer.settings(settings);
+        write_buffer_.append(writer.buffer());
+    } else {
+        write_buffer_.append(kH2Preface);
+        const Setting settings[] = {
+            { kSettingEnablePush, 0 },
+            { kSettingInitialWindowSize, kStreamRecvWindow },
+            { kSettingMaxFrameSize, kDefaultMaxFrameSize },
+        };
+        FrameWriter writer;
+        writer.settings(settings);
+        write_buffer_.append(writer.buffer());
+    }
 
     FrameWriter update;
     update.window_update(0, kConnRecvWindow - kDefaultInitialWindowSize);
     write_buffer_.append(update.buffer());
 }
 
-std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::string_view path, HeaderList headers,
-                                                 bool end_stream)
+std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::string_view path,
+                                                 HeaderList headers, bool end_stream,
+                                                 std::optional<std::uint64_t> content_length)
 {
     if (method.empty())
         throw std::invalid_argument("h2 open: empty method");
@@ -745,7 +839,16 @@ std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::s
         stream->local_closed_ = true;
         stream->end_sent_ = true;
     }
-    streams_.emplace(id, stream);
+
+    if (mode_ == WireMode::Native) {
+        if (!native::encode_request(method, path, std::span<const HeaderField>(headers), content_length,
+                                    native_head_scratch_, true)) {
+            throw std::invalid_argument("native open: invalid request head");
+        }
+        streams_.emplace(id, stream);
+        send_headers(id, native_head_scratch_, end_stream);
+        return stream;
+    }
 
     HeaderList block;
     block.reserve(4 + headers.size());
@@ -774,6 +877,7 @@ std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::s
 
     std::string encoded;
     encoder_.encode(block, encoded);
+    streams_.emplace(id, stream);
     send_headers(id, encoded, end_stream);
     return stream;
 }
@@ -1199,17 +1303,61 @@ void H2Connection::handle_headers(const Frame &frame)
 
 void H2Connection::finish_headers(std::uint32_t stream_id, std::string_view block, bool end_stream)
 {
-    HeaderList headers;
-    if (!decoder_.decode(block, headers)) {
-        send_goaway(ErrorCode::Compression);
-        close_with_error(EPROTO);
-        return;
+    ResponseHead head;
+
+    if (mode_ == WireMode::Native) {
+        std::vector<native::HeaderView> views;
+        native::ResponseHead decoded;
+        if (!native::decode_response(block, views, decoded, native::kMaxHeaders, native::kMaxBlock)) {
+            send_goaway(ErrorCode::Protocol);
+            close_with_error(EPROTO);
+            return;
+        }
+
+        head.status = decoded.status;
+        head.content_length = decoded.content_length;
+        head.protocol = Protocol::Native;
+        head.headers.reserve(views.size() + (decoded.content_length.has_value() ? 1 : 0));
+
+        bool has_content_length = false;
+        for (const native::HeaderView &view : views) {
+            if (iequals(view.first, "content-length"))
+                has_content_length = true;
+            head.headers.push_back(HeaderField{ std::string(view.first), std::string(view.second) });
+        }
+        if (decoded.content_length.has_value() && !has_content_length)
+            head.headers.push_back(HeaderField{ "content-length", std::to_string(*decoded.content_length) });
+    } else {
+        HeaderList headers;
+        if (!decoder_.decode(block, headers)) {
+            send_goaway(ErrorCode::Compression);
+            close_with_error(EPROTO);
+            return;
+        }
+
+        head.protocol = Protocol::Http2;
+        for (HeaderField &header : headers) {
+            if (header.name == ":status") {
+                try {
+                    head.status = std::stoi(header.value);
+                } catch (...) {
+                    head.status = 0;
+                }
+            } else if (!header.name.empty() && header.name[0] != ':') {
+                if (iequals(header.name, "content-length")) {
+                    std::uint64_t length = 0;
+                    if (parse_uint(header.value, length))
+                        head.content_length = length;
+                }
+                head.headers.push_back(std::move(header));
+            }
+        }
     }
 
     const auto it = streams_.find(stream_id);
     if (it == streams_.end())
         return;
-    it->second->on_headers(std::move(headers), end_stream);
+    it->second->on_head(std::move(head), end_stream);
 }
 
 void H2Connection::handle_data(const Frame &frame)

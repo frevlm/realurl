@@ -45,6 +45,7 @@ int main()
 
     realurl::EventLoop loop;
     realurl::Config config;
+    config.protocol = realurl::Protocol::Http2;
     config.max_conns_per_origin = 1;
     config.max_streams_per_conn = 32;
     config.connect_timeout = 2s;
