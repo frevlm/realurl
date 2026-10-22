@@ -800,11 +800,122 @@ int free_port()
     return port;
 }
 
+/// Deterministic JSON-like text, compressible the way API responses are.
+std::string json_body(std::size_t size)
+{
+    std::string out = "[";
+    for (int i = 0; out.size() < size; ++i) {
+        out += "{\"id\":" + std::to_string(i) + ",\"name\":\"user-" + std::to_string(i * 7919 % 1000) +
+               "\",\"active\":" + (i % 3 == 0 ? "true" : "false") + ",\"score\":" + std::to_string(i * 37 % 101) +
+               "},";
+    }
+    out.resize(size);
+    return out;
+}
+
+/// Unary GETs of a JSON body from a realurl Server, with native DATA
+/// compression on or off at both ends. Reports wire bytes from the loopback
+/// interface counters.
+int run_native_json(int total, int concurrency, int body_kib, int connections, realurl::Protocol protocol,
+                    bool compression)
+{
+    total = std::max(1, total);
+    concurrency = std::max(1, concurrency);
+    connections = std::max(1, connections);
+    const std::string json = json_body(static_cast<std::size_t>(std::max(1, body_kib)) * 1024);
+
+    const int port = free_port();
+    if (port <= 0) {
+        std::fprintf(stderr, "native_json: cannot reserve a local port\n");
+        return 1;
+    }
+
+    realurl::Server server;
+    server.set_io_threads(1);
+    server.set_native_compression(compression);
+    server.Get("/json", [&json](const auto &, auto &response) {
+        response.set_content(std::string_view{ json }, "application/json");
+    });
+
+    std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
+    for (int i = 0; i < 1000 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(1ms);
+    if (!server.is_running()) {
+        server.stop();
+        listener.join();
+        std::fprintf(stderr, "native_json: server failed to start\n");
+        return 1;
+    }
+
+    realurl::Config config;
+    config.protocol = protocol;
+    config.native_compression = compression;
+    config.max_conns_per_origin = connections;
+    config.max_streams_per_conn = (concurrency + connections - 1) / connections;
+    realurl::ClientGroup group(1, config);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/json";
+
+    try {
+        const realurl::Response warmup = realurl::sync_wait(group.get(url));
+        if (warmup.body != json)
+            throw std::runtime_error("body mismatch");
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "native_json: warmup failed: %s\n", error.what());
+        server.stop();
+        listener.join();
+        return 1;
+    }
+
+    std::atomic<int> next{ 0 };
+    std::atomic<int> done{ 0 };
+    std::atomic<int> failures{ 0 };
+    std::vector<double> latencies(static_cast<std::size_t>(total));
+
+    const std::uint32_t wire_start = bench::loopback_tx_bytes();
+    const bench::CpuTime cpu_start = bench::cpu_time();
+    const auto wall_start = std::chrono::steady_clock::now();
+
+    H2ServerBenchState state{ &group, url, total, &next, &done, &failures, &latencies };
+    for (int i = 0; i < concurrency; ++i)
+        group.spawn(h2_server_bench_worker(state));
+
+    while (done.load(std::memory_order_acquire) < total)
+        std::this_thread::sleep_for(1ms);
+
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+    const bench::CpuTime cpu_end = bench::cpu_time();
+    const std::uint32_t wire = bench::loopback_tx_bytes() - wire_start;
+
+    const std::vector<double> pct = percentiles(latencies);
+    const int failed = failures.load(std::memory_order_relaxed);
+    const double cpu_total = cpu_end.total() - cpu_start.total();
+    const double payload = static_cast<double>(json.size()) * total;
+
+    std::printf("mode=native_json protocol=%s compression=%s requests=%d concurrency=%d body=%dKiB "
+                "connections=%d\n",
+                protocol == realurl::Protocol::Native ? "native" : "h2", compression ? "on" : "off", total,
+                concurrency, body_kib, connections);
+    std::printf("  status: %d ok, %d failed in %.2fs (%.0f req/s, %.1f MB/s body)\n", total - failed, failed, wall,
+                total / wall, payload / (1024.0 * 1024.0) / wall);
+    if (!pct.empty())
+        std::printf("  latency ms: p50=%.3f p90=%.3f p99=%.3f max=%.3f\n", pct[0], pct[1], pct[3], pct[5]);
+    std::printf("  cpu: user=%.2fs sys=%.2fs total=%.2fs (%.1f us/req)\n", cpu_end.user - cpu_start.user,
+                cpu_end.system - cpu_start.system, cpu_total, cpu_total * 1e6 / total);
+    std::printf("  wire: %.1f MB on loopback (%.0f B/req, %.3f of body)\n", megabytes(wire),
+                static_cast<double>(wire) / total, static_cast<double>(wire) / payload);
+    std::printf("  rss: peak=%.1fMB\n", megabytes(bench::peak_rss_bytes()));
+
+    group.close();
+    server.stop();
+    listener.join();
+    return failed == 0 ? 0 : 1;
+}
+
 /// Same workload as run_llm(), but the endpoint is a realurl Server so both
 /// the HTTP/2 and native transports can be compared against identical server
 /// code. The server streams 1 KiB over duration_seconds chunks.
 int run_server_llm(int total, int concurrency, int duration_seconds, bool streaming, int connections,
-                   realurl::Protocol protocol)
+                   realurl::Protocol protocol, std::size_t body_bytes = 2 * 1024 * 1024, bool bulk = false)
 {
     total = std::max(1, total);
     concurrency = std::max(1, concurrency);
@@ -819,14 +930,14 @@ int run_server_llm(int total, int concurrency, int duration_seconds, bool stream
 
     realurl::Server server;
     server.set_io_threads(1);
-    server.set_payload_max_length(4 * 1024 * 1024);
+    server.set_payload_max_length(std::max<std::size_t>(4 * 1024 * 1024, body_bytes * 2));
     server.set_read_header_timeout(0ms);
     server.set_client_write_timeout(std::chrono::seconds(duration_seconds + 60));
 
     server.Get("/llm", [](const auto &, auto &response) { response.set_content("ok"); });
-    server.Post("/llm", [duration_seconds, streaming](const realurl::Server::Request &request,
+    server.Post("/llm", [duration_seconds, streaming, bulk, body_bytes](const realurl::Server::Request &request,
                                                        realurl::Server::Response &response) {
-        response.take_over_task([duration_seconds, streaming, &request](
+        response.take_over_task([duration_seconds, streaming, bulk, body_bytes, &request](
                                     realurl::server::StreamWriter &writer) -> realurl::Task<void> {
             const realurl::server::Header headers[] = { { "content-type", "text/plain" } };
             co_await writer.write_head(200, headers, std::nullopt);
@@ -850,7 +961,7 @@ int run_server_llm(int total, int concurrency, int duration_seconds, bool stream
             } else {
                 if (duration_seconds > 0)
                     co_await request.loop->sleep_for(std::chrono::seconds(duration_seconds));
-                co_await writer.write(std::string(1024, 'T'));
+                co_await writer.write(std::string(bulk ? body_bytes : 1024, 'T'));
             }
             co_await writer.end();
         });
@@ -873,7 +984,7 @@ int run_server_llm(int total, int concurrency, int duration_seconds, bool stream
     config.max_streams_per_conn = (concurrency + connections - 1) / connections;
     realurl::Client client(loop, config);
     const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/llm";
-    const std::string prompt_2mb(2 * 1024 * 1024, 'P');
+    const std::string prompt_2mb(body_bytes, 'P');
 
     std::atomic<int> remaining{ total };
     std::atomic<int> completed{ 0 };
@@ -921,10 +1032,11 @@ int run_server_llm(int total, int concurrency, int duration_seconds, bool stream
     std::printf("  status: %d passed, %d failed in %.2fs (%.2f req/s, %.1f RPM)\n",
                 total - failed_count.load(), failed_count.load(), wall, total / wall,
                 (total / wall) * 60.0);
-    std::printf("  data: %.1f MB uploaded (%.1f MB/s), %.1f KB downloaded\n",
+    std::printf("  data: %.1f MB uploaded (%.1f MB/s), %.1f KB downloaded (%.1f MB/s)\n",
                 total_uploaded.load() / (1024.0 * 1024.0),
                 (total_uploaded.load() / (1024.0 * 1024.0)) / wall,
-                total_downloaded.load() / 1024.0);
+                total_downloaded.load() / 1024.0,
+                (total_downloaded.load() / (1024.0 * 1024.0)) / wall);
     if (!pct_ttft.empty())
         std::printf("  ttft ms:   p50=%.1f p90=%.1f p95=%.1f p99=%.1f max=%.1f\n", pct_ttft[0],
                     pct_ttft[1], pct_ttft[2], pct_ttft[3], pct_ttft[5]);
@@ -1776,6 +1888,28 @@ int main(int argc, char **argv)
         return run_server_llm(total, concurrency, duration, streaming, connections,
                               native ? realurl::Protocol::Native : realurl::Protocol::Http2);
     }
+    if (mode == "native_json") {
+        const int total = argc > 2 ? std::atoi(argv[2]) : 20000;
+        const int concurrency = argc > 3 ? std::atoi(argv[3]) : 100;
+        const int body_kib = argc > 4 ? std::atoi(argv[4]) : 64;
+        const int connections = argc > 5 ? std::atoi(argv[5]) : 1;
+        const bool native = argc > 6 ? std::string(argv[6]) != "h2" : true;
+        const bool compression = argc > 7 ? std::string(argv[7]) != "off" : true;
+        return run_native_json(total, concurrency, body_kib, connections,
+                               native ? realurl::Protocol::Native : realurl::Protocol::Http2, compression);
+    }
+    if (mode == "native_bulk") {
+        // native_bulk <requests> <concurrency> <body_kib> <connections> <protocol>
+        const int total = argc > 2 ? std::atoi(argv[2]) : 200;
+        const int concurrency = argc > 3 ? std::atoi(argv[3]) : 8;
+        const int body_kib = argc > 4 ? std::atoi(argv[4]) : 2048;
+        const int connections = argc > 5 ? std::atoi(argv[5]) : 1;
+        const bool native =
+            argc > 6 ? (std::string(argv[6]) == "native" || std::string(argv[6]) == "1") : true;
+        return run_server_llm(total, concurrency, 0, false, connections,
+                              native ? realurl::Protocol::Native : realurl::Protocol::Http2,
+                              static_cast<std::size_t>(std::max(1, body_kib)) * 1024, true);
+    }
     if (mode == "pump" || mode == "async") {
         const int concurrency = argc > 2 ? std::atoi(argv[2]) : 128;
         const int chunks = argc > 3 ? std::atoi(argv[3]) : 10;
@@ -1811,6 +1945,8 @@ int main(int argc, char **argv)
                  "usage: %s requests <N> <concurrency> [connections] | requests_mt <N> <concurrency> <workers> "
                  "[connections] | h2_unary|native_unary <N> <concurrency> <workers> [h2|native] | hold <streams> | llm <total> <concurrency> [duration_s] [streaming] [connections] "
                  "| native_llm <total> <concurrency> [duration_s] [streaming] [connections] [h2|native] "
+                 "| native_json <N> <concurrency> [body_kib] [connections] [h2|native] [on|off] "
+                 "| native_bulk <N> <concurrency> [body_kib] [connections] [h2|native] "
                  "| pump <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| async <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| proxy <concurrency> [chunks] [interval_ms] [timeout_ms] [workers] [bridge|block] "

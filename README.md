@@ -50,6 +50,11 @@ prefers the realurl native transport and silently falls back to HTTP/2;
 `Protocol::Http2` disables native negotiation, and `Protocol::Native` requires
 it. `ResponseHead::protocol` reports what was negotiated and
 `ResponseHead::content_length` carries the body length when known.
+`Config::native_compression` (default `false`) compresses native DATA frames
+with zstd when the server has also opted in with
+`Server::set_native_compression(true)`. It pays off only on links slower than
+one core's compression rate (about 5 Gbit/s for JSON); on loopback and fast
+LANs it costs throughput. See `docs/native.md`.
 
 `ClientGroup` runs N loop/client pairs on N threads and spreads work across
 them. Tasks run on a worker loop use that worker's client directly (no
@@ -119,6 +124,7 @@ Options:
 | `REALURL_BUILD_BENCH` | `OFF` | Loopback h2c benchmark |
 | `REALURL_WITH_HTTPLIB` | `OFF` | cpp-httplib response-sink adapter |
 | `REALURL_WITH_IO_URING` | `OFF` | io_uring transport on Linux: multishot recv + provided buffers, one-shot send fallback |
+| `REALURL_WITH_ZSTD` | `ON` | zstd compression of `realurl/1` DATA frames; built without it (with a warning) when zstd is not found (`brew install zstd`, `libzstd-dev`) |
 
 OpenSSL types stay inside `src/detail/tls.cpp` and
 `src/detail/tls_server.cpp`. BoringSSL is no longer used because it does not

@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <system_error>
@@ -54,6 +55,12 @@ bool iequals(std::string_view left, std::string_view right) noexcept
             return false;
     }
     return true;
+}
+
+bool has_content_encoding(const HeaderList &headers) noexcept
+{
+    return std::any_of(headers.begin(), headers.end(),
+                       [](const HeaderField &header) { return iequals(header.name, "content-encoding"); });
 }
 
 bool parse_uint(std::string_view text, std::uint64_t &out) noexcept
@@ -435,7 +442,11 @@ Task<std::size_t> H2StreamImpl::read(std::span<char> buffer, std::chrono::millis
         throw std::invalid_argument("h2 read: empty buffer");
 
     if (!recv_queue_.empty()) {
-        const std::size_t n = recv_queue_.read(buffer);
+        std::size_t n = 0;
+        if (!recv_queue_.read(buffer, n)) {
+            reject_data();
+            throw std::system_error(EPROTO, std::generic_category(), "h2 read");
+        }
         flush_window();
         co_return n;
     }
@@ -452,7 +463,10 @@ Task<void> H2StreamImpl::read_all(std::string &out, std::chrono::milliseconds id
 {
     for (;;) {
         if (!recv_queue_.empty()) {
-            recv_queue_.drain_to(out);
+            if (!recv_queue_.drain_to(out)) {
+                reject_data();
+                throw std::system_error(EPROTO, std::generic_category(), "h2 read");
+            }
             flush_window();
         }
         if (error_ != 0)
@@ -556,30 +570,45 @@ void H2StreamImpl::on_head(ResponseHead &&head, bool end_stream)
     }
 }
 
-void H2StreamImpl::on_data(std::string_view data, bool end_stream, std::uint32_t flow_bytes)
+void H2StreamImpl::on_data(std::string_view payload, std::size_t decoded, bool compressed, bool end_stream,
+                           std::uint32_t flow_bytes)
 {
     if (closed_)
         return;
 
     recv_unacked_ += flow_bytes;
-
-    if (read_waiter_ != nullptr) {
-        ReadAwaiter *waiter = read_waiter_;
-        const std::size_t n = std::min(data.size(), waiter->buffer_.size());
-        if (n > 0)
-            std::memcpy(waiter->buffer_.data(), data.data(), n);
-        waiter->n_ = n;
-        recv_queue_.append(data.substr(n));
-        complete_read(waiter);
-    } else {
-        recv_queue_.append(data);
-    }
-
+    recv_queue_.push(payload, decoded, compressed);
     if (end_stream)
         remote_closed_ = true;
 
+    if (!wake_reader())
+        return;
     flush_window();
     check_closed();
+}
+
+/// Hand queued bytes, or the end of the body, to a parked reader. Returns
+/// false when a compressed payload does not decode, which resets the stream.
+bool H2StreamImpl::wake_reader()
+{
+    if (read_waiter_ == nullptr || (recv_queue_.empty() && !remote_closed_))
+        return true;
+    ReadAwaiter *waiter = read_waiter_;
+    if (!recv_queue_.read(waiter->buffer_, waiter->n_)) {
+        reject_data();
+        return false;
+    }
+    complete_read(waiter);
+    return true;
+}
+
+void H2StreamImpl::reject_data()
+{
+    if (connection_ != nullptr) {
+        connection_->send_rst(id_, ErrorCode::Protocol);
+        connection_->schedule_flush();
+    }
+    fail(EPROTO);
 }
 
 void H2StreamImpl::on_rst(ErrorCode code)
@@ -652,11 +681,12 @@ PumpResult H2StreamImpl::pump_one_frame()
                                                         connection_->max_frame_size()));
     }
 
-    // END_STREAM rides on the frame that carries the last queued byte.
+    // END_STREAM rides on the frame that carries the last queued byte. Flow
+    // control counts the frame as sent, which may be compressed.
     const bool end_stream = end_pending_ && chunk.size() == send_queue_.size();
-    connection_->append_data(id_, chunk, end_stream);
-    connection_->consume_send_window(chunk.size());
-    send_window_ -= static_cast<std::int64_t>(chunk.size());
+    const std::size_t wire = connection_->append_data(id_, chunk, end_stream, !body_encoded_);
+    connection_->consume_send_window(wire);
+    send_window_ -= static_cast<std::int64_t>(wire);
     send_queue_.consume(chunk.size());
 
     if (send_queue_.size() <= kSendLowWater && write_waiter_ != nullptr)
@@ -732,22 +762,24 @@ void H2StreamImpl::check_closed()
 }
 
 H2Connection::H2Connection(EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority,
-                           std::string scheme, WireMode mode)
+                           std::string scheme, WireMode mode, bool native_compression)
     : loop_(loop)
     , transport_(std::move(transport))
     , authority_(std::move(authority))
     , scheme_(std::move(scheme))
     , mode_(mode)
     , flush_signal_(loop)
+    , compression_offered_(mode == WireMode::Native && native_compression && native::DataCodec::available())
 {
+    parser_.set_max_frame_size(local_max_frame_size_);
 }
 
 Task<std::shared_ptr<H2Connection>> H2Connection::connect(
     EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority, std::string scheme,
-    WireMode mode, bool probe_native, std::chrono::milliseconds probe_timeout)
+    WireMode mode, bool probe_native, std::chrono::milliseconds probe_timeout, bool native_compression)
 {
     std::shared_ptr<H2Connection> connection(new H2Connection(
-        loop, std::move(transport), std::move(authority), std::move(scheme), mode));
+        loop, std::move(transport), std::move(authority), std::move(scheme), mode, native_compression));
     connection->send_preface();
 
     if (probe_native) {
@@ -772,17 +804,19 @@ void H2Connection::send_preface()
         write_buffer_.append(kNativePreface);
         const Setting settings[] = {
             { kSettingInitialWindowSize, kStreamRecvWindow },
-            { kSettingMaxFrameSize, kDefaultMaxFrameSize },
+            { kSettingMaxFrameSize, local_max_frame_size_ },
+            { kSettingNativeCompression, kNativeCompressionZstd },
         };
+        const std::size_t count = compression_offered_ ? std::size(settings) : std::size(settings) - 1;
         FrameWriter writer;
-        writer.settings(settings);
+        writer.settings({ settings, count });
         write_buffer_.append(writer.buffer());
     } else {
         write_buffer_.append(kH2Preface);
         const Setting settings[] = {
             { kSettingEnablePush, 0 },
             { kSettingInitialWindowSize, kStreamRecvWindow },
-            { kSettingMaxFrameSize, kDefaultMaxFrameSize },
+            { kSettingMaxFrameSize, local_max_frame_size_ },
         };
         FrameWriter writer;
         writer.settings(settings);
@@ -811,6 +845,7 @@ std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::s
     next_stream_id_ += 2;
 
     auto stream = std::make_shared<H2StreamImpl>(*this, id, peer_initial_window_);
+    stream->body_encoded_ = has_content_encoding(headers);
     if (end_stream) {
         stream->local_closed_ = true;
         stream->end_sent_ = true;
@@ -864,10 +899,11 @@ void H2Connection::send_headers(std::uint32_t stream_id, std::string_view block,
     schedule_flush();
 }
 
-void H2Connection::append_data(std::uint32_t stream_id, std::string_view data, bool end_stream)
+std::size_t H2Connection::append_data(std::uint32_t stream_id, std::string_view data, bool end_stream,
+                                      bool compressible)
 {
-    append_frame_header(write_buffer_, FrameType::Data, end_stream ? kFlagEndStream : 0, stream_id, data.size());
-    write_buffer_.append(data);
+    native::DataCodec *codec = compressible && compression_offered_ && peer_compression_ ? &codec_ : nullptr;
+    return native::append_data_frame(write_buffer_, stream_id, data, end_stream, codec);
 }
 
 void H2Connection::send_rst(std::uint32_t stream_id, ErrorCode code)
@@ -1191,6 +1227,10 @@ void H2Connection::handle_settings(std::string_view payload, bool ack)
         case kSettingHeaderTableSize:
             decoder_.set_max_allowed_table_size(value);
             break;
+        case kSettingNativeCompression:
+            if (mode_ == WireMode::Native)
+                peer_compression_ = (value & kNativeCompressionZstd) != 0;
+            break;
         default:
             break;
         }
@@ -1331,9 +1371,31 @@ void H2Connection::handle_data(const Frame &frame)
         data.remove_suffix(pad);
     }
 
+    // The compressed flag is defined only by the native transport; HTTP/2
+    // ignores undefined flags (RFC 9113 section 4.1).
+    const bool compressed = mode_ == WireMode::Native && (frame.header.flags & kFlagNativeCompressed) != 0;
+    if (compressed && !compression_offered_) {
+        send_goaway(ErrorCode::Protocol);
+        close_with_error(EPROTO);
+        return;
+    }
+
+    // Flow control counts the wire bytes. A compressed payload is checked
+    // here and decoded when the caller reads it; one whose header does not
+    // check out resets its stream, and the connection window still accounts
+    // for it.
     const auto it = streams_.find(frame.header.stream_id);
-    if (it != streams_.end())
-        it->second->on_data(data, (frame.header.flags & kFlagEndStream) != 0, frame.header.length);
+    if (it != streams_.end()) {
+        std::size_t decoded = data.size();
+        if (compressed && !native::content_size(data, local_max_frame_size_, decoded)) {
+            send_rst(frame.header.stream_id, ErrorCode::Protocol);
+            schedule_flush();
+            it->second->fail(EPROTO);
+        } else {
+            it->second->on_data(data, decoded, compressed, (frame.header.flags & kFlagEndStream) != 0,
+                                frame.header.length);
+        }
+    }
 
     recv_unacked_ += frame.header.length;
     if (recv_unacked_ >= 32768) {

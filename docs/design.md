@@ -12,8 +12,12 @@ cross-thread entry point (mutex + swap + eventfd/EVFILT_USER wakeup) and it is
 not on the request path.
 
 A `Client` and every connection it creates belong to one loop. Connections are
-never shared between loops; `SSL_CTX` (via `TlsContext`) is the only shared
-TLS object because OpenSSL 3.x guarantees its thread safety.
+never shared between loops. Each `Client` owns its `TlsContext`; the client
+keeps the most recent TLS session per `host:port` (up to 256, oldest evicted)
+and offers it on reconnect, so a new connection to a known origin resumes
+instead of redoing the key exchange. The cache is unlocked because only the
+owning loop thread touches it. Only sessions from a verified handshake are
+cached and they are never offered to another host name; 0-RTT is not used.
 
 `ClientGroup` owns N loop/client pairs, one per worker thread. A task submitted
 with `spawn()`/`spawn_on()` runs on a worker loop, and `get()`/`request()`
@@ -88,7 +92,9 @@ frame limit are split into CONTINUATION frames; the reader enforces that no
 other frame type may appear inside a header sequence.
 
 Each stream buffers its outgoing and incoming body bytes in a `ByteQueue`, one
-contiguous buffer with a read cursor. The writer sends one frame per stream
+contiguous buffer with a read cursor. Incoming native DATA goes through a
+`native::RecvQueue`, which keeps compressed payloads compressed until the
+reader pulls them, so receive buffering is measured in wire bytes. The writer sends one frame per stream
 turn, and END_STREAM rides on the frame that carries the last queued byte, so
 a unary response is HEADERS + one DATA frame, and an empty body ends on
 HEADERS.

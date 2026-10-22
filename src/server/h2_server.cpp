@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstring>
+#include <iterator>
 #include <netdb.h>
 #include <optional>
 #include <stdexcept>
@@ -50,6 +51,12 @@ bool forbidden_header(std::string_view name) noexcept
     return iequals(name, "connection") || iequals(name, "keep-alive") ||
            iequals(name, "proxy-connection") || iequals(name, "transfer-encoding") ||
            iequals(name, "upgrade");
+}
+
+bool has_content_encoding(std::span<const Header> headers) noexcept
+{
+    return std::any_of(headers.begin(), headers.end(),
+                       [](const Header &header) { return iequals(header.first, "content-encoding"); });
 }
 
 long long parse_content_length(std::string_view value) noexcept
@@ -188,11 +195,11 @@ class H2ServerStream final : public StreamWriter,
                              public std::enable_shared_from_this<H2ServerStream>
 {
 public:
-    H2ServerStream(H2ServerConnection &connection, std::uint32_t id)
+    H2ServerStream(H2ServerConnection &connection, std::uint32_t id, std::uint32_t initial_window)
         : connection_(&connection)
         , loop_(&connection.loop())
         , id_(id)
-        , send_window_(h2::kDefaultInitialWindowSize)
+        , send_window_(initial_window)
     {
     }
 
@@ -213,7 +220,8 @@ public:
 
     void on_headers(h2::HeaderList &&headers, bool end_stream);
     void on_native_headers(std::string block, bool end_stream);
-    void on_data(std::string_view data, bool end_stream, std::uint32_t flow_bytes);
+    void on_data(std::string_view payload, std::size_t decoded, bool compressed, bool end_stream,
+                 std::uint32_t flow_bytes);
     void on_rst();
     void on_window_update(std::uint32_t increment);
     void on_settings_initial_window(std::int32_t delta);
@@ -266,6 +274,8 @@ private:
                              long long content_length, bool end_stream,
                              std::string_view version);
     void flush_window();
+    bool wake_reader();
+    void reject_data();
     void fail(int error);
     void check_closed();
     std::size_t send_pending() const noexcept
@@ -294,9 +304,11 @@ private:
     bool remote_closed_ = false;
     bool closed_ = false;
     bool head_only_ = false;
+    /// The response head carried content-encoding; its body is sent as is.
+    bool body_encoded_ = false;
     int error_ = 0;
 
-    ByteQueue recv_queue_;
+    native::RecvQueue recv_queue_;
     std::uint32_t recv_unacked_ = 0;
     std::int64_t recv_window_ = kStreamRecvWindow;
 
@@ -422,7 +434,10 @@ H2ServerConnection::H2ServerConnection(ServerContext &context, EventLoop &loop,
     , peer_(peer)
     , flush_signal_(std::make_unique<FlushSignal>(loop))
     , close_signal_(std::make_unique<FlushSignal>(loop))
+    , compression_offered_(mode == WireMode::Native && context.native_compression &&
+                           native::DataCodec::available())
 {
+    parser_.set_max_frame_size(local_max_frame_size_);
     char host[NI_MAXHOST] = {};
     char service[NI_MAXSERV] = {};
     if (::getnameinfo(reinterpret_cast<sockaddr *>(&peer_), sizeof(peer_), host, sizeof(host), service,
@@ -459,17 +474,19 @@ void H2ServerConnection::send_preface()
 
         const h2::Setting settings[] = {
             { h2::kSettingInitialWindowSize, kStreamRecvWindow },
-            { h2::kSettingMaxFrameSize, h2::kDefaultMaxFrameSize },
+            { h2::kSettingMaxFrameSize, local_max_frame_size_ },
             { h2::kSettingMaxConcurrentStreams, kMaxStreams },
+            { kSettingNativeCompression, kNativeCompressionZstd },
         };
+        const std::size_t count = compression_offered_ ? std::size(settings) : std::size(settings) - 1;
         h2::FrameWriter writer;
-        writer.settings(settings);
+        writer.settings({ settings, count });
         write_buffer_.append(writer.buffer());
     } else {
         const h2::Setting settings[] = {
             { h2::kSettingEnablePush, 0 },
             { h2::kSettingInitialWindowSize, kStreamRecvWindow },
-            { h2::kSettingMaxFrameSize, h2::kDefaultMaxFrameSize },
+            { h2::kSettingMaxFrameSize, local_max_frame_size_ },
             { h2::kSettingMaxConcurrentStreams, kMaxStreams },
         };
         h2::FrameWriter writer;
@@ -654,6 +671,10 @@ void H2ServerConnection::handle_settings(std::string_view payload, bool ack)
             }
             max_frame_size_ = value;
             break;
+        case kSettingNativeCompression:
+            if (mode_ == WireMode::Native)
+                peer_compression_ = (value & kNativeCompressionZstd) != 0;
+            break;
         default:
             break;
         }
@@ -726,53 +747,52 @@ void H2ServerConnection::finish_headers(std::uint32_t stream_id, std::string_vie
         return;
     }
 
-    auto it = streams_.find(stream_id);
-
-    if (mode_ == WireMode::Native) {
-        if (it == streams_.end()) {
-            if (active_streams_ >= kMaxStreams) {
-                send_rst(stream_id, h2::ErrorCode::RefusedStream);
-                return;
-            }
-
-            auto stream = std::make_shared<H2ServerStream>(*this, stream_id);
-            streams_.emplace(stream_id, stream);
-            ++active_streams_;
-            stream->on_native_headers(std::string(block), end_stream);
-            if (stream->done())
-                return;
-            loop_.spawn(stream->run_handler());
-            return;
-        }
-
-        it->second->on_native_headers(std::string(block), end_stream);
-        return;
-    }
-
+    // Every HPACK block advances the decoder, so HTTP/2 decodes it before
+    // looking at the stream.
     h2::HeaderList headers;
-    if (!decoder_.decode(block, headers, 65536)) {
+    if (mode_ != WireMode::Native && !decoder_.decode(block, headers, 65536)) {
         send_goaway(h2::ErrorCode::Compression);
         close_with_error(EPROTO);
         return;
     }
 
+    const auto it = streams_.find(stream_id);
     if (it == streams_.end()) {
-        if (active_streams_ >= kMaxStreams) {
-            send_rst(stream_id, h2::ErrorCode::RefusedStream);
-            return;
-        }
+        open_stream(stream_id, block, std::move(headers), end_stream);
+        return;
+    }
+    // A closed stream stays in the map until the writer reaps it. HEADERS on
+    // it is a stream error (RFC 9113 section 5.1).
+    if (it->second->done()) {
+        send_rst(stream_id, h2::ErrorCode::StreamClosed);
+        return;
+    }
+    deliver_headers(*it->second, block, std::move(headers), end_stream);
+}
 
-        auto stream = std::make_shared<H2ServerStream>(*this, stream_id);
-        streams_.emplace(stream_id, stream);
-        ++active_streams_;
-        stream->on_headers(std::move(headers), end_stream);
-        if (stream->done())
-            return;
-        loop_.spawn(stream->run_handler());
+void H2ServerConnection::open_stream(std::uint32_t stream_id, std::string_view block, h2::HeaderList &&headers,
+                                     bool end_stream)
+{
+    if (active_streams_ >= kMaxStreams) {
+        send_rst(stream_id, h2::ErrorCode::RefusedStream);
         return;
     }
 
-    it->second->on_headers(std::move(headers), end_stream);
+    auto stream = std::make_shared<H2ServerStream>(*this, stream_id, peer_initial_window_);
+    streams_.emplace(stream_id, stream);
+    ++active_streams_;
+    deliver_headers(*stream, block, std::move(headers), end_stream);
+    if (!stream->done())
+        loop_.spawn(stream->run_handler());
+}
+
+void H2ServerConnection::deliver_headers(H2ServerStream &stream, std::string_view block, h2::HeaderList &&headers,
+                                         bool end_stream)
+{
+    if (mode_ == WireMode::Native)
+        stream.on_native_headers(std::string(block), end_stream);
+    else
+        stream.on_headers(std::move(headers), end_stream);
 }
 
 void H2ServerConnection::handle_data(const h2::Frame &frame)
@@ -800,18 +820,38 @@ void H2ServerConnection::handle_data(const h2::Frame &frame)
         data.remove_suffix(pad);
     }
 
-    const auto it = streams_.find(frame.header.stream_id);
-    if (it == streams_.end()) {
-        send_rst(frame.header.stream_id, h2::ErrorCode::StreamClosed);
+    // The compressed flag is defined only by the native transport; HTTP/2
+    // ignores undefined flags (RFC 9113 section 4.1).
+    const bool compressed = mode_ == WireMode::Native && (frame.header.flags & kFlagNativeCompressed) != 0;
+    if (compressed && !compression_offered_) {
+        send_goaway(h2::ErrorCode::Protocol);
+        close_with_error(EPROTO);
         return;
     }
-    it->second->on_data(data, (frame.header.flags & h2::kFlagEndStream) != 0, frame.header.length);
 
+    // Flow control counts the wire bytes. The connection window accounts for
+    // every DATA frame, including frames for streams that are gone.
     recv_unacked_ += frame.header.length;
     if (recv_unacked_ >= kWindowUpdateThreshold) {
         send_window_update(0, recv_unacked_);
         recv_unacked_ = 0;
     }
+
+    const auto it = streams_.find(frame.header.stream_id);
+    if (it == streams_.end()) {
+        send_rst(frame.header.stream_id, h2::ErrorCode::StreamClosed);
+        return;
+    }
+
+    // A compressed payload is checked here and decoded when the handler reads
+    // it. One whose header does not check out resets its stream.
+    std::size_t decoded = data.size();
+    if (compressed && !native::content_size(data, local_max_frame_size_, decoded)) {
+        send_rst(frame.header.stream_id, h2::ErrorCode::Protocol);
+        it->second->fail(EPROTO);
+        return;
+    }
+    it->second->on_data(data, decoded, compressed, (frame.header.flags & h2::kFlagEndStream) != 0, frame.header.length);
 }
 
 void H2ServerConnection::handle_window_update(const h2::Frame &frame)
@@ -909,11 +949,11 @@ bool H2ServerConnection::encode_response_head(int status, std::span<const Header
     return true;
 }
 
-void H2ServerConnection::append_data(std::uint32_t stream_id, std::string_view data, bool end_stream)
+std::size_t H2ServerConnection::append_data(std::uint32_t stream_id, std::string_view data, bool end_stream,
+                                            bool compressible)
 {
-    h2::append_frame_header(write_buffer_, h2::FrameType::Data, end_stream ? h2::kFlagEndStream : 0,
-                            stream_id, data.size());
-    write_buffer_.append(data);
+    native::DataCodec *codec = compressible && compression_offered_ && peer_compression_ ? &codec_ : nullptr;
+    return native::append_data_frame(write_buffer_, stream_id, data, end_stream, codec);
 }
 
 void H2ServerConnection::send_rst(std::uint32_t stream_id, h2::ErrorCode code)
@@ -1086,6 +1126,8 @@ void H2ServerStream::finish_request_head(std::string_view method, std::string_vi
 
 void H2ServerStream::on_headers(h2::HeaderList &&headers, bool end_stream)
 {
+    if (closed_)
+        return;
     if (head_ready_) {
         remote_closed_ = remote_closed_ || end_stream;
         if (end_stream) {
@@ -1120,6 +1162,8 @@ void H2ServerStream::on_headers(h2::HeaderList &&headers, bool end_stream)
 
 void H2ServerStream::on_native_headers(std::string block, bool end_stream)
 {
+    if (closed_)
+        return;
     if (head_ready_) {
         std::vector<native::HeaderView> trailers;
         if (!native::decode_trailers(block, trailers, native::kMaxHeaders, kMaxHeaderBlock)) {
@@ -1173,7 +1217,8 @@ void H2ServerStream::on_native_headers(std::string block, bool end_stream)
     finish_request_head(decoded.method, decoded.target, content_length, end_stream, "realurl/1");
 }
 
-void H2ServerStream::on_data(std::string_view data, bool end_stream, std::uint32_t flow_bytes)
+void H2ServerStream::on_data(std::string_view payload, std::size_t decoded, bool compressed, bool end_stream,
+                             std::uint32_t flow_bytes)
 {
     if (closed_)
         return;
@@ -1184,26 +1229,36 @@ void H2ServerStream::on_data(std::string_view data, bool end_stream, std::uint32
         return;
     }
     recv_unacked_ += flow_bytes;
-
-    if (read_waiter_ != nullptr) {
-        ReadAwaiter *waiter = read_waiter_;
-        const std::size_t n = std::min(data.size(), waiter->buffer_.size());
-        if (n > 0)
-            std::memcpy(waiter->buffer_.data(), data.data(), n);
-        waiter->n_ = n;
-        recv_queue_.append(data.substr(n));
-        complete_read(waiter);
-    } else {
-        recv_queue_.append(data);
-    }
-
+    recv_queue_.push(payload, decoded, compressed);
     if (end_stream)
         remote_closed_ = true;
 
+    if (!wake_reader())
+        return;
     flush_window();
-    if (end_stream && read_waiter_ != nullptr && recv_queue_.empty())
-        complete_read(read_waiter_);
     check_closed();
+}
+
+/// Hand queued bytes, or the end of the body, to a parked reader. Returns
+/// false when a compressed payload does not decode, which resets the stream.
+bool H2ServerStream::wake_reader()
+{
+    if (read_waiter_ == nullptr || (recv_queue_.empty() && !remote_closed_))
+        return true;
+    ReadAwaiter *waiter = read_waiter_;
+    if (!recv_queue_.read(waiter->buffer_, waiter->n_)) {
+        reject_data();
+        return false;
+    }
+    complete_read(waiter);
+    return true;
+}
+
+void H2ServerStream::reject_data()
+{
+    if (connection_ != nullptr)
+        connection_->send_rst(id_, h2::ErrorCode::Protocol);
+    fail(EPROTO);
 }
 
 void H2ServerStream::on_rst()
@@ -1213,6 +1268,10 @@ void H2ServerStream::on_rst()
 
 void H2ServerStream::on_window_update(std::uint32_t increment)
 {
+    // A closed stream stays in the map until the writer reaps it; the peer may
+    // still credit it, and there is nothing left to send.
+    if (closed_)
+        return;
     if (send_window_ + static_cast<std::int64_t>(increment) > static_cast<std::int64_t>(kMaxWindow)) {
         fail(EPROTO);
         return;
@@ -1229,6 +1288,8 @@ void H2ServerStream::on_window_update(std::uint32_t increment)
 
 void H2ServerStream::on_settings_initial_window(std::int32_t delta)
 {
+    if (closed_)
+        return;
     send_window_ += delta;
     if (blocked_on_window_ && send_window_ > 0) {
         blocked_on_window_ = false;
@@ -1308,7 +1369,11 @@ Task<std::size_t> H2ServerStream::read(std::span<char> buffer)
         throw std::invalid_argument("h2 server read: empty buffer");
 
     if (!recv_queue_.empty()) {
-        const std::size_t n = recv_queue_.read(buffer);
+        std::size_t n = 0;
+        if (!recv_queue_.read(buffer, n)) {
+            reject_data();
+            throw std::system_error(EPROTO, std::generic_category(), "h2 server read");
+        }
         flush_window();
         co_return n;
     }
@@ -1334,6 +1399,7 @@ Task<void> H2ServerStream::write_head(int status, std::span<const Header> header
         co_return;
     }
     head_sent_ = true;
+    body_encoded_ = has_content_encoding(headers);
     if (no_body) {
         end_sent_ = true;
         local_closed_ = true;
@@ -1380,6 +1446,8 @@ void H2ServerStream::cancel()
 
 Task<void> H2ServerStream::send_error(int status)
 {
+    if (closed_)
+        co_return;
     Response response;
     response.status = status;
     connection_->context().apply_error_body(response, status);
@@ -1408,6 +1476,7 @@ Task<void> H2ServerStream::send_fixed_response(const Response &response)
         co_return;
     }
     head_sent_ = true;
+    body_encoded_ = has_content_encoding(views);
 
     if (no_body) {
         end_sent_ = true;
@@ -1459,12 +1528,15 @@ Task<void> H2ServerStream::run_handler()
     if (request_.body_mode == BodyMode::Buffered) {
         const std::size_t payload_max = connection_->context().payload_max;
         for (;;) {
-            if (payload_max != 0 && request_.body.size() + recv_queue_.size() > payload_max) {
+            if (payload_max != 0 && request_.body.size() + recv_queue_.decoded_size() > payload_max) {
                 co_await send_error(413);
                 co_return;
             }
             if (!recv_queue_.empty()) {
-                recv_queue_.drain_to(request_.body);
+                if (!recv_queue_.drain_to(request_.body)) {
+                    reject_data();
+                    co_return;
+                }
                 flush_window();
             }
             if (error_ != 0)
@@ -1541,11 +1613,12 @@ H2PumpResult H2ServerStream::pump_one_frame()
                                                         connection_->max_frame_size()));
     }
 
-    // END_STREAM rides on the frame that carries the last queued byte.
+    // END_STREAM rides on the frame that carries the last queued byte. Flow
+    // control counts the frame as sent, which may be compressed.
     const bool end_stream = end_pending_ && chunk.size() == send_queue_.size();
-    connection_->append_data(id_, chunk, end_stream);
-    connection_->consume_send_window(chunk.size());
-    send_window_ -= static_cast<std::int64_t>(chunk.size());
+    const std::size_t wire = connection_->append_data(id_, chunk, end_stream, !body_encoded_);
+    connection_->consume_send_window(wire);
+    send_window_ -= static_cast<std::int64_t>(wire);
     send_queue_.consume(chunk.size());
 
     if (send_queue_.size() <= kSendLowWater && write_waiter_ != nullptr)

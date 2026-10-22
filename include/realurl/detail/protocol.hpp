@@ -27,4 +27,12 @@ inline constexpr std::size_t kNativeHelloPayloadSize = 12;
 inline constexpr std::uint8_t kNativeVersionMajor = 1;
 inline constexpr std::uint8_t kNativeVersionMinor = 0;
 
+/// Native-only SETTINGS entry. The value is a bitmask of the DATA codecs the
+/// sender can decode; a peer compresses DATA only after it sees the bit.
+inline constexpr std::uint16_t kSettingNativeCompression = 0x10;
+inline constexpr std::uint32_t kNativeCompressionZstd = 0x1;
+
+/// Native-only DATA flag: the payload is one standalone zstd frame.
+inline constexpr std::uint8_t kFlagNativeCompressed = 0x20;
+
 } // namespace realurl::detail

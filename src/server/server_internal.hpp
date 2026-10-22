@@ -48,6 +48,7 @@ struct ServerContext
     bool path_decoding = true;
     bool keep_alive = true;
     bool native_enabled = true;
+    bool native_compression = false;
     StreamStrategy default_strategy = StreamStrategy::Auto;
     std::size_t queue_high = 64 * 1024;
     std::size_t queue_low = 32 * 1024;

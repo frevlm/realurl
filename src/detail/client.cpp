@@ -250,7 +250,8 @@ private:
 
             try {
                 std::shared_ptr<H2Connection> connection = co_await H2Connection::connect(
-                    *loop_, std::move(transport), url.authority(), url.scheme, mode, probe, probe_timeout);
+                    *loop_, std::move(transport), url.authority(), url.scheme, mode, probe, probe_timeout,
+                    config_.native_compression);
                 pool.wire_mode = mode;
                 pool.wire_mode_known = true;
                 co_return connection;

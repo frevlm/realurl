@@ -48,6 +48,23 @@ ordinary h2c server sends SETTINGS first, so the probe fails cleanly and the
 client reconnects with the HTTP/2 preface. The result is cached per origin
 (`scheme://authority`); the failed probe happens at most once per origin.
 
+### DATA compression
+
+Native SETTINGS may carry one extra entry:
+
+| Setting | Id | Value |
+| --- | ---: | --- |
+| `NATIVE_COMPRESSION` | 0x10 | bitmask of DATA codecs the sender can decode; bit0 = zstd |
+
+A native peer sends it when built with zstd and compression is enabled.
+Compression is off by default on both sides; opt in with
+`Config::native_compression = true` and `Server::set_native_compression(true)`.
+A peer
+compresses outgoing DATA only after it has received the other side's SETTINGS
+with bit0 set, so DATA sent before that arrives is plain. Peers that never
+send the entry (older realurl, or builds without zstd) ignore it as an unknown
+setting and only ever see plain DATA. The entry is never sent in HTTP/2 mode.
+
 ## Frames
 
 The 9-byte HTTP/2 frame header is reused unchanged:
@@ -79,6 +96,27 @@ u16   capabilities = 0   (big-endian, reserved)
 
 Native mode does not use the `PADDED` or `PRIORITY` flags; native peers never
 set them. `ENABLE_PUSH` is not sent in native SETTINGS.
+
+DATA frames have one native-only flag:
+
+| Flag | Value | Meaning |
+| --- | ---: | --- |
+| END_STREAM | 0x1 | unchanged |
+| COMPRESSED | 0x20 | payload is one complete, standalone zstd frame |
+
+Each compressed frame is independent: no dictionary or window is shared
+across frames, and the zstd frame header must declare the content size. The
+sender compresses a payload only when it is at least 1024 bytes, the stream's
+head did not carry `content-encoding`, and the result is smaller than the
+input; otherwise the frame goes out plain. Compression runs on chunks of at
+most `max_frame_size` input bytes (the receiver's advertised
+`SETTINGS_MAX_FRAME_SIZE`), so a compressed frame always fits that frame size
+and decompresses to at most that many bytes. Flow control and `max_frame_size` count wire bytes, the
+frame length after compression, exactly as HTTP/2 counts bytes on the wire.
+
+A receiver that did not advertise zstd treats the flag as a connection error
+(`GOAWAY PROTOCOL_ERROR`). An HTTP/2 connection ignores it, like any flag that
+is undefined for the frame type.
 
 ## Head block
 
@@ -183,9 +221,22 @@ length travels in the flags/varint field instead.
 | Status | 100..599 |
 | Varint | unsigned LEB128, max 10 bytes, overflow rejected; lengths/counts are also bounded by the limits above |
 | `content-length` | must fit `uint64`; the server also enforces `set_payload_max_length()` before reading the body |
+| Compressed DATA frame | one zstd frame whose declared content size is at most the receiver's advertised `SETTINGS_MAX_FRAME_SIZE`; no trailing bytes |
 
 A malformed block resets the stream; an oversized head block closes the
 connection with `GOAWAY`. The connection survives a stream-level parse error.
+A compressed DATA frame that does not decode, has no content size, or
+declares more than the receiver's advertised `SETTINGS_MAX_FRAME_SIZE` resets
+its stream with `PROTOCOL_ERROR`; its bytes still count against the
+connection window, and the connection keeps serving. A legitimate sender never
+exceeds that size, so one compressed frame never inflates beyond one frame's
+worth of plain DATA.
+
+A receiver checks the zstd frame header when the frame arrives and keeps the
+payload compressed until the application reads it, so the DATA a stream
+buffers is bounded by its flow-control window in wire bytes, plus at most one
+decoded frame. A payload whose header checks out but whose body does not
+decode resets its stream when it is read.
 
 ## API
 
@@ -194,6 +245,7 @@ realurl::Config config;
 config.protocol = realurl::Protocol::Auto;   // default
 // Protocol::Http2  -> never offer realurl/1
 // Protocol::Native -> require realurl/1
+config.native_compression = true;            // opt in: zstd DATA when the server opted in too
 ```
 
 `ResponseHead` now reports the negotiated transport and the body length:
@@ -213,6 +265,7 @@ Server-side:
 ```cpp
 realurl::Server server;
 server.set_native(false);   // opt out of ALPN realurl/1 and the native preface
+server.set_native_compression(true);    // opt in to zstd DATA (default off)
 ```
 
 `Server::Stats` counts connections per protocol:
@@ -242,7 +295,14 @@ server.set_upstream(upstream);
 - A plaintext `Protocol::Auto` client probes native first. A non-realurl peer
   costs one failed connection on first contact, cached per origin; set
   `Protocol::Http2` to skip the probe entirely.
-- `set_native(false)` must be called before `listen()`.
+- `set_native(false)` and `set_native_compression()` must be called before
+  `listen()`.
+- DATA compression is built when CMake finds zstd (`REALURL_WITH_ZSTD`,
+  default `ON`) and is off at runtime until both sides opt in. It trades CPU
+  for bandwidth: it wins only when the link is slower than about 5 Gbit/s per
+  server core (JSON, level 1); on loopback and fast LANs it lowers throughput
+  (see `docs/performance.md`). Leave it off where CPU is the bottleneck or
+  bodies are already compressed without a `content-encoding` header.
 - The native transport sends `Request::version = "realurl/1"`; handlers that
   switch on the version string should account for it.
 

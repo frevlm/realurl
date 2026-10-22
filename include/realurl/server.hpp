@@ -107,6 +107,11 @@ public:
     /// REALURL/1 preface). Enabled by default; call before listen().
     Server &set_native(bool enabled = true);
 
+    /// Compress native DATA frames with zstd when the client supports it.
+    /// Disabled by default; ignored when built without zstd. Call before
+    /// listen().
+    Server &set_native_compression(bool enabled = true);
+
     /// Default strategy for routes that do not override it.
     Server &set_strategy(StreamStrategy strategy);
 

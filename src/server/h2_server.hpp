@@ -4,6 +4,7 @@
 
 #include "realurl/detail/frame.hpp"
 #include "realurl/detail/hpack.hpp"
+#include "realurl/detail/native_compression.hpp"
 
 #include <deque>
 #include <memory>
@@ -43,7 +44,9 @@ public:
         return context_;
     }
 
-    void append_data(std::uint32_t stream_id, std::string_view data, bool end_stream);
+    /// Queue one DATA frame and return its wire length. Compressible payloads
+    /// are compressed once the native peer has advertised support.
+    std::size_t append_data(std::uint32_t stream_id, std::string_view data, bool end_stream, bool compressible);
     void send_rst(std::uint32_t stream_id, h2::ErrorCode code);
     void send_window_update(std::uint32_t stream_id, std::uint32_t increment);
     void enqueue_write(std::uint32_t stream_id);
@@ -84,6 +87,8 @@ private:
     void handle_settings(std::string_view payload, bool ack);
     void handle_headers(const h2::Frame &frame);
     void finish_headers(std::uint32_t stream_id, std::string_view block, bool end_stream);
+    void open_stream(std::uint32_t stream_id, std::string_view block, h2::HeaderList &&headers, bool end_stream);
+    void deliver_headers(H2ServerStream &stream, std::string_view block, h2::HeaderList &&headers, bool end_stream);
     void handle_data(const h2::Frame &frame);
     void handle_window_update(const h2::Frame &frame);
     void handle_goaway(std::string_view payload);
@@ -103,6 +108,7 @@ private:
     h2::FrameParser parser_;
     h2::HpackDecoder decoder_;
     h2::HpackEncoder encoder_;
+    native::DataCodec codec_;
 
     std::string read_buffer_;
     std::string write_buffer_;
@@ -124,11 +130,19 @@ private:
 
     std::uint32_t max_stream_id_ = 0;
     std::uint32_t max_frame_size_ = h2::kDefaultMaxFrameSize;
+    /// SETTINGS_MAX_FRAME_SIZE we advertise and parse with. The peer
+    /// compresses at most this much input per DATA frame, so it also bounds
+    /// one decompressed frame.
+    std::uint32_t local_max_frame_size_ = h2::kDefaultMaxFrameSize;
     std::uint32_t peer_initial_window_ = h2::kDefaultInitialWindowSize;
     std::int64_t send_window_ = h2::kDefaultInitialWindowSize;
     std::uint32_t recv_unacked_ = 0;
 
     std::size_t active_streams_ = 0;
+    /// We advertised kSettingNativeCompression and accept compressed DATA.
+    bool compression_offered_ = false;
+    /// The peer advertised zstd decoding; outgoing DATA may be compressed.
+    bool peer_compression_ = false;
     bool closed_ = false;
 };
 

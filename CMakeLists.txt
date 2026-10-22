@@ -23,6 +23,7 @@ option(REALURL_BUILD_EXAMPLES "Build examples" ON)
 option(REALURL_BUILD_BENCH "Build benchmarks" OFF)
 option(REALURL_WITH_HTTPLIB "Provide the cpp-httplib response-sink adapter target" OFF)
 option(REALURL_WITH_IO_URING "Use the io_uring completion transport for h2c (Linux)" OFF)
+option(REALURL_WITH_ZSTD "zstd compression of realurl/1 DATA frames" ON)
 
 find_package(Threads REQUIRED)
 
@@ -54,6 +55,27 @@ if(EXISTS "${OPENSSL_INCLUDE_DIR}/openssl/opensslv.h")
 endif()
 
 # ---------------------------------------------------------------------------
+# zstd (optional): per-frame compression of native DATA frames. Without it the
+# native transport never advertises compression and sends DATA unchanged.
+# ---------------------------------------------------------------------------
+
+set(REALURL_HAVE_ZSTD OFF)
+if(REALURL_WITH_ZSTD)
+  find_path(REALURL_ZSTD_INCLUDE_DIR zstd.h PATHS /opt/homebrew/include /usr/local/include)
+  find_library(REALURL_ZSTD_LIBRARY NAMES zstd PATHS /opt/homebrew/lib /usr/local/lib)
+  if(REALURL_ZSTD_INCLUDE_DIR AND REALURL_ZSTD_LIBRARY)
+    add_library(realurl::zstd UNKNOWN IMPORTED)
+    set_target_properties(realurl::zstd PROPERTIES
+      IMPORTED_LOCATION "${REALURL_ZSTD_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${REALURL_ZSTD_INCLUDE_DIR}")
+    set(REALURL_HAVE_ZSTD ON)
+    message(STATUS "realurl: zstd found at ${REALURL_ZSTD_LIBRARY}")
+  else()
+    message(WARNING "realurl: zstd not found; building without native DATA compression")
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # core: transport, event loop, HTTP/2 client. No Boost, no libcurl.
 # ---------------------------------------------------------------------------
 
@@ -68,6 +90,7 @@ add_library(realurl_core
   src/detail/frame.cpp
   src/detail/hpack.cpp
   src/detail/native_codec.cpp
+  src/detail/native_compression.cpp
   src/detail/url.cpp
   src/detail/connection.cpp
   src/detail/client.cpp
@@ -88,6 +111,11 @@ target_include_directories(realurl_core PUBLIC
   "$<INSTALL_INTERFACE:include>")
 target_link_libraries(realurl_core PUBLIC Threads::Threads)
 target_link_libraries(realurl_core PRIVATE OpenSSL::SSL OpenSSL::Crypto realurl_warnings)
+
+if(REALURL_HAVE_ZSTD)
+  target_link_libraries(realurl_core PRIVATE realurl::zstd)
+  target_compile_definitions(realurl_core PRIVATE REALURL_HAVE_ZSTD=1)
+endif()
 
 if(REALURL_WITH_IO_URING)
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")

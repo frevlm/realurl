@@ -59,6 +59,12 @@ struct Config {
     /// Auto prefers the realurl native transport and falls back to HTTP/2.
     /// Http2 disables native negotiation entirely. Native requires it.
     Protocol protocol = Protocol::Auto;
+
+    /// Native transport only: compress DATA frames with zstd when the server
+    /// supports it. Off by default: it trades CPU for bandwidth and only pays
+    /// off on links slower than one core's compression rate. Ignored for
+    /// HTTP/2 and when built without zstd.
+    bool native_compression = false;
 };
 
 namespace detail

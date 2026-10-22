@@ -908,6 +908,12 @@ Server &Server::set_native(bool enabled)
     return *this;
 }
 
+Server &Server::set_native_compression(bool enabled)
+{
+    impl_->context.native_compression = enabled;
+    return *this;
+}
+
 Server &Server::set_strategy(StreamStrategy strategy)
 {
     impl_->context.default_strategy = strategy;

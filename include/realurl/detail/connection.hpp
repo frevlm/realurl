@@ -4,6 +4,7 @@
 #include "realurl/detail/event_loop.hpp"
 #include "realurl/detail/frame.hpp"
 #include "realurl/detail/hpack.hpp"
+#include "realurl/detail/native_compression.hpp"
 #include "realurl/detail/protocol.hpp"
 #include "realurl/detail/socket.hpp"
 #include "realurl/detail/transport.hpp"
@@ -113,7 +114,8 @@ public:
     void cancel();
 
     void on_head(ResponseHead &&head, bool end_stream);
-    void on_data(std::string_view data, bool end_stream, std::uint32_t flow_bytes);
+    void on_data(std::string_view payload, std::size_t decoded, bool compressed, bool end_stream,
+                 std::uint32_t flow_bytes);
     void on_rst(ErrorCode code);
     void on_window_update(std::uint32_t increment);
     void on_connection_closed(int error);
@@ -153,6 +155,8 @@ private:
     void fail(int error);
     void check_closed();
     void flush_window();
+    bool wake_reader();
+    void reject_data();
     std::size_t send_pending() const noexcept
     {
         return send_queue_.size();
@@ -175,11 +179,13 @@ private:
     bool end_sent_ = false;
     bool in_write_queue_ = false;
     bool blocked_on_window_ = false;
+    /// The request head carried content-encoding; its body is sent as is.
+    bool body_encoded_ = false;
     int error_ = 0;
 
     ResponseHead head_result_;
 
-    ByteQueue recv_queue_;
+    native::RecvQueue recv_queue_;
     std::size_t recv_unacked_ = 0;
 
     ByteQueue send_queue_;
@@ -196,7 +202,8 @@ public:
     static Task<std::shared_ptr<H2Connection>> connect(
         EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority,
         std::string scheme, WireMode mode = WireMode::Http2, bool probe_native = false,
-        std::chrono::milliseconds probe_timeout = std::chrono::milliseconds{ 1000 });
+        std::chrono::milliseconds probe_timeout = std::chrono::milliseconds{ 1000 },
+        bool native_compression = false);
 
     std::shared_ptr<H2StreamImpl> open(std::string_view method, std::string_view path, HeaderList headers,
                                        bool end_stream,
@@ -224,7 +231,9 @@ public:
 
     void schedule_flush();
     void enqueue_write(std::uint32_t stream_id);
-    void append_data(std::uint32_t stream_id, std::string_view data, bool end_stream);
+    /// Queue one DATA frame and return its wire length. Compressible payloads
+    /// are compressed once the native peer has advertised support.
+    std::size_t append_data(std::uint32_t stream_id, std::string_view data, bool end_stream, bool compressible);
     void send_rst(std::uint32_t stream_id, ErrorCode code);
     void send_window_update(std::uint32_t stream_id, std::uint32_t increment);
     void on_stream_closed(std::uint32_t stream_id);
@@ -248,7 +257,7 @@ public:
 
 private:
     H2Connection(EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority,
-                 std::string scheme, WireMode mode);
+                 std::string scheme, WireMode mode, bool native_compression);
 
     Task<void> reader_loop();
     Task<void> writer_loop();
@@ -279,6 +288,7 @@ private:
     FrameParser parser_;
     HpackDecoder decoder_;
     HpackEncoder encoder_;
+    native::DataCodec codec_;
 
     std::string native_head_scratch_;
     std::vector<std::pair<std::string_view, std::string_view>> native_views_;
@@ -300,10 +310,18 @@ private:
     std::uint32_t next_stream_id_ = 1;
     std::uint32_t max_streams_ = 100;
     std::uint32_t max_frame_size_ = kDefaultMaxFrameSize;
+    /// SETTINGS_MAX_FRAME_SIZE we advertise and parse with. The peer
+    /// compresses at most this much input per DATA frame, so it also bounds
+    /// one decompressed frame.
+    std::uint32_t local_max_frame_size_ = kDefaultMaxFrameSize;
     std::uint32_t peer_initial_window_ = kDefaultInitialWindowSize;
     std::int64_t send_window_ = kDefaultInitialWindowSize;
     std::uint32_t recv_unacked_ = 0;
 
+    /// We advertised kSettingNativeCompression and accept compressed DATA.
+    bool compression_offered_ = false;
+    /// The peer advertised zstd decoding; outgoing DATA may be compressed.
+    bool peer_compression_ = false;
     bool usable_ = true;
     bool closed_ = false;
 };

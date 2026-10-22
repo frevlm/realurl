@@ -7,6 +7,50 @@ the clocks, so percentiles reflect steady state. RSS/CPU include the in-tree
 test server that runs in the same process. The tables below the architecture
 pass are the original 0.3 baseline.
 
+## Native DATA compression (zstd)
+
+`native_json` serves a JSON body from a realurl `Server` over `realurl/1`
+and toggles per-frame zstd (level 1) on both ends
+(`Config::native_compression`, `Server::set_native_compression()`; both
+default off, so `off` is the default configuration). Apple M5 / macOS,
+loopback, Release build, one connection, 100 concurrent streams, client and
+server in the same process. Wire bytes come from the loopback interface
+counter and include TCP/IP headers. Each row is the median of three
+interleaved runs (host load average about 4.5).
+
+| Body | Compression | req/s | p50 | CPU/req | Wire/req | Wire/body |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 KiB | off | 626,509 | 0.155 ms | 1.9 µs | 4,176 B | 1.020 |
+| 4 KiB | on | 113,615 | 0.844 ms | 10.2 µs | 607 B | 0.148 |
+| 64 KiB | off | 76,652 | 1.186 ms | 20.5 µs | 65,912 B | 1.006 |
+| 64 KiB | on | 10,871 | 9.330 ms | 118.1 µs | 7,964 B | 0.122 |
+| 256 KiB | off | 18,885 | 5.079 ms | 85.1 µs | 263,504 B | 1.005 |
+| 256 KiB | on | 3,266 | 30.475 ms | 470.1 µs | 30,615 B | 0.117 |
+
+Compression cuts wire bytes 7-8.6x for this body and costs about 1.5 µs of
+CPU per KiB (compress on the server plus decompress on the client). Loopback
+bandwidth is free, so every row with compression is slower here: the server
+loop is busy compressing. The same holds on a fast LAN. The trade flips only
+when the link is slower than one core's compression rate: for the 64 KiB
+body, one server loop compresses about 715 MB/s of body (10.9k req/s), so a
+link below about 5-6 Gbit/s per server core moves fewer uncompressed
+responses than that (estimate from the rates above: 1 Gbit/s gives ~1,900
+req/s plain vs ~10,900 req/s compressed, CPU-bound). That is why compression
+is opt-in.
+
+### Reproduce
+
+```sh
+./build-release/bench/realurl_bench native_json 50000 100 4 1 native on
+./build-release/bench/realurl_bench native_json 50000 100 4 1 native off
+./build-release/bench/realurl_bench native_json 20000 100 64 1 native on
+./build-release/bench/realurl_bench native_json 20000 100 64 1 native off
+./build-release/bench/realurl_bench native_json 5000 100 256 1 native on
+./build-release/bench/realurl_bench native_json 5000 100 256 1 native off
+```
+
+The loopback counter is 32-bit; keep a run under 4 GiB of traffic.
+
 ## Two-end hot path (0.5.x)
 
 Measured on Apple M5 / macOS, loopback, Release build. `base` is commit
@@ -172,6 +216,25 @@ cmake --build build --target realurl_bench
 `native_llm` uses a realurl `Server` endpoint for both protocols; the
 historical `llm` mode still uses the in-tree h2-only test server and is not
 directly comparable to these A/B numbers.
+
+## Frame size and TCP_NOTSENT_LOWAT (not adopted)
+
+`native_bulk <requests> <concurrency> <body_kib> <connections> <protocol>` does
+a POST of `body_kib` and reads the same number of bytes back through a realurl
+`Server`. Apple M5 / macOS, loopback, Release build, medians of 3 interleaved
+runs, `native_bulk 1000 8 2048 1 native` (other agents were loading the host, so
+run-to-run spread is about +/-15%).
+
+| Native SETTINGS_MAX_FRAME_SIZE | 2 MiB bulk MB/s (each way) | 64 KiB bulk MB/s | `native_llm` TTFT p50 |
+|---|---:|---:|---:|
+| 16 KiB (current) | 2028 | 2263 | 93 ms |
+| 64 KiB | 2013 | 2138 | 116 ms |
+| 256 KiB | 2121 | 1798 | 104 ms |
+
+No measurable win, so native mode keeps 16 KiB. `TCP_NOTSENT_LOWAT = 16 KiB` on
+both ends gave a bulk median of 770 MB/s against 850 MB/s without (6 interleaved
+runs) and an unresolved TTFT difference (150 ms vs 160 ms, 3 runs), so it is not
+applied either.
 
 ## Single-runtime server (0.4)
 

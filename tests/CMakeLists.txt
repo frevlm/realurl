@@ -51,9 +51,23 @@ realurl_add_test(native_server_test)
 target_link_libraries(native_server_test PRIVATE realurl::server realurl_test_support OpenSSL::SSL OpenSSL::Crypto)
 target_compile_definitions(native_server_test PRIVATE REALURL_CERT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/certs")
 
+realurl_add_test(native_compression_test)
+target_link_libraries(native_compression_test PRIVATE realurl::server)
+if(REALURL_HAVE_ZSTD)
+  target_link_libraries(native_compression_test PRIVATE realurl::zstd)
+  target_compile_definitions(native_compression_test PRIVATE REALURL_HAVE_ZSTD=1)
+endif()
+
+realurl_add_test(closed_stream_test)
+target_link_libraries(closed_stream_test PRIVATE realurl::server)
+
 realurl_add_test(tls_server_test)
 target_link_libraries(tls_server_test PRIVATE realurl::server realurl_test_support OpenSSL::SSL OpenSSL::Crypto)
 target_compile_definitions(tls_server_test PRIVATE REALURL_CERT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/certs")
+
+realurl_add_test(tls_resume_test)
+target_link_libraries(tls_resume_test PRIVATE realurl::server)
+target_compile_definitions(tls_resume_test PRIVATE REALURL_CERT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/certs")
 
 realurl_add_test(ktls_test)
 target_link_libraries(ktls_test PRIVATE realurl::core OpenSSL::SSL OpenSSL::Crypto)
