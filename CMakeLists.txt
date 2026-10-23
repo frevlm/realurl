@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(realurl VERSION 0.3.0 LANGUAGES C CXX)
+project(realurl VERSION 0.4.0 LANGUAGES C CXX)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   message(FATAL_ERROR "realurl requires Clang (GCC's coroutine frontend ICEs on this codebase)")
