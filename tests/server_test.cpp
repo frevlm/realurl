@@ -87,6 +87,35 @@ void test_process_async_take_over()
     CHECK(raw.find("\r\n\r\nasync") != std::string::npos);
 }
 
+void test_process_task_take_over()
+{
+    realurl::Server server;
+    server.Post(
+        "/echo",
+        [](const realurl::Server::Request &req, realurl::Server::Response &res) {
+            res.take_over_task([&req](realurl::server::StreamWriter &out) -> realurl::Task<void> {
+                std::string body;
+                char buffer[3];
+                for (;;) {
+                    const std::size_t n = co_await req.read_body({ buffer, sizeof(buffer) });
+                    if (n == 0)
+                        break;
+                    body.append(buffer, n);
+                }
+                const realurl::server::Header headers[] = { { "content-type", "text/plain" } };
+                co_await out.write_head(200, headers, body.size());
+                co_await out.write(body);
+                co_await out.end();
+            });
+        },
+        { .body_mode = realurl::Server::BodyMode::StreamedNative });
+
+    const std::string raw =
+        server.process("POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 11\r\n\r\nhello world");
+    CHECK(starts_with(raw, "HTTP/1.1 200 OK\r\n"));
+    CHECK(raw.find("\r\n\r\nhello world") != std::string::npos);
+}
+
 void test_process_limits()
 {
     realurl::Server server;
@@ -438,6 +467,7 @@ int main()
     test_process_basics();
     test_process_take_over();
     test_process_async_take_over();
+    test_process_task_take_over();
     test_process_limits();
     test_process_streamed_chunked_rejected();
     test_process_streamed_missing_content_length_rejected();

@@ -691,9 +691,13 @@ std::string Server::Impl::process(std::string_view raw_request, std::string_view
         if (head.content_length < 0)
             return context.error_response(400);
     }
+    detail::MemoryBodyReader memory_reader(body);
     if (request.body_mode == BodyMode::Buffered) {
         request.body = std::move(body);
         request.content_length = static_cast<long long>(request.body.size());
+    } else if (request.body_mode == BodyMode::StreamedNative) {
+        request.body_reader = &memory_reader;
+        request.content_length = static_cast<long long>(body.size());
     } else {
         const std::size_t body_size = body.size();
         request.body_source = detail::make_memory_source(std::make_shared<std::string>(std::move(body)));
@@ -714,12 +718,22 @@ std::string Server::Impl::process(std::string_view raw_request, std::string_view
         MemoryStreamWriter writer(out);
         EventLoop private_loop;
         request.loop = &private_loop;
-        try {
-            detail::sync_wait(response.task_take_over_fn()(writer));
-        } catch (...) {
-            if (out.empty())
-                return context.error_response(500);
-        }
+        bool done = false;
+        bool failed = false;
+        auto run = [&]() -> Task<void> {
+            try {
+                co_await response.task_take_over_fn()(writer);
+            } catch (...) {
+                failed = true;
+            }
+            done = true;
+            private_loop.stop();
+        };
+        private_loop.spawn(run());
+        while (!done)
+            private_loop.run_once();
+        if (failed && out.empty())
+            return context.error_response(500);
         return out;
     }
 

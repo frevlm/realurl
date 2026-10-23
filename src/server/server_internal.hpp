@@ -10,10 +10,13 @@
 
 #include <boost/asio/io_context.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -89,6 +92,32 @@ void serialize_fixed_response(const Response &response, bool head_only, bool kee
 std::string_view current_date() noexcept;
 
 std::shared_ptr<BodySource> make_memory_source(std::shared_ptr<std::string> data);
+
+/// BodyReader over an in-memory body (Server::process).
+class MemoryBodyReader final : public BodyReader
+{
+public:
+    explicit MemoryBodyReader(std::string_view data) noexcept
+        : data_(data)
+    {
+    }
+
+    Task<std::size_t> read(std::span<char> buffer) override
+    {
+        const std::size_t n = std::min(buffer.size(), data_.size());
+        std::memcpy(buffer.data(), data_.data(), n);
+        data_.remove_prefix(n);
+        co_return n;
+    }
+
+    std::uint64_t remaining() const noexcept override
+    {
+        return data_.size();
+    }
+
+private:
+    std::string_view data_;
+};
 
 class H1StreamWriter;
 
