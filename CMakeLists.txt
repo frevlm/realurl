@@ -26,6 +26,16 @@ option(REALURL_WITH_IO_URING "Use the io_uring completion transport for h2c (Lin
 
 find_package(Threads REQUIRED)
 
+# ccache when available: cold rebuilds of an identical tree (fresh clone, new
+# build dir) replay from cache in ~1s instead of re-parsing Boost.Asio per TU.
+if(NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
+  find_program(REALURL_CCACHE ccache)
+  if(REALURL_CCACHE)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${REALURL_CCACHE}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${REALURL_CCACHE}")
+  endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # OpenSSL 3.x: TLS 1.3, ALPN, and (Linux) kernel TLS. BoringSSL is not used
 # because it does not expose kTLS or SSL_sendfile.

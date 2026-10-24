@@ -104,11 +104,18 @@ OpenSSL 3.x development headers. macOS: `brew install openssl@3` and pass
 GCC is not supported: its coroutine frontend ICEs on this codebase, including
 the current release.
 
+A `ccache` on `PATH` is picked up automatically and makes repeat cold builds
+(fresh clone, new build directory) replay from cache in about a second. Pass
+`-DCMAKE_CXX_COMPILER_LAUNCHER=` to opt out.
+
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+Build caching (ccache auto-detection, CI, Docker): see
+[docs/build-caching.md](docs/build-caching.md).
 
 Options:
 
