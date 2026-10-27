@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1075,6 +1076,7 @@ int run_server_llm(int total, int concurrency, int duration_seconds, bool stream
 struct PumpClientResult {
     double ttft_ms = 0;
     double total_ms = 0;
+    int events = 0;
     bool ok = false;
 };
 
@@ -1102,6 +1104,8 @@ struct PollSlot {
     bool connected = false;
     bool done = false;
     bool first_byte = false;
+    int match = 0;
+    int events = 0;
     std::chrono::steady_clock::time_point start{};
     std::chrono::steady_clock::time_point first{};
 };
@@ -1110,7 +1114,15 @@ struct PollRunResult {
     double wall_seconds = 0;
     bench::CpuTime cpu_start{};
     bench::CpuTime cpu_end{};
+    double thread_cpu_seconds = 0; // CPU burned by the client thread itself
 };
+
+double thread_cpu_seconds()
+{
+    timespec now{};
+    ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    return static_cast<double>(now.tv_sec) + static_cast<double>(now.tv_nsec) / 1e9;
+}
 
 sockaddr_in loopback_address(int port)
 {
@@ -1129,8 +1141,10 @@ bool set_nonblocking(int fd)
 
 /// Single-threaded poll client. One thread per connection would cap the bench
 /// at the process thread limit long before the server's concurrency limit.
+/// count_events tallies "data: " occurrences per stream into results[i].events.
 PollRunResult run_poll_clients(int port, int concurrency, int timeout_ms, PumpBenchState &state,
-                               std::string_view path = "/stream", std::string_view body = {})
+                               std::string_view path = "/stream", std::string_view body = {},
+                               bool count_events = false)
 {
     const std::string head =
         body.empty() ? "GET " + std::string(path) + " HTTP/1.1\r\nHost: bench\r\n\r\n"
@@ -1232,6 +1246,7 @@ PollRunResult run_poll_clients(int port, int concurrency, int timeout_ms, PumpBe
 
     PollRunResult run;
     run.cpu_start = bench::cpu_time();
+    const double thread_cpu_start = thread_cpu_seconds();
     const auto start = std::chrono::steady_clock::now();
     int active = 0;
 
@@ -1306,12 +1321,28 @@ PollRunResult run_poll_clients(int port, int concurrency, int timeout_ms, PumpBe
                         slot.first_byte = true;
                         slot.first = std::chrono::steady_clock::now();
                     }
+                    if (count_events) {
+                        // "data: " has no proper border, so a mismatch restarts at 0 or 1.
+                        static constexpr std::string_view kMarker = "data: ";
+                        for (ssize_t b = 0; b < n; ++b) {
+                            const char c = buffer[b];
+                            if (c == kMarker[static_cast<std::size_t>(slot.match)])
+                                ++slot.match;
+                            else
+                                slot.match = (c == kMarker[0]) ? 1 : 0;
+                            if (slot.match == static_cast<int>(kMarker.size())) {
+                                slot.match = 0;
+                                ++slot.events;
+                            }
+                        }
+                    }
                     continue;
                 }
                 if (n == 0) {
                     const auto end = std::chrono::steady_clock::now();
                     auto &out = state.results[static_cast<std::size_t>(index)];
                     out.ok = true;
+                    out.events = slot.events;
                     out.ttft_ms = std::chrono::duration<double, std::milli>(slot.first - slot.start).count();
                     out.total_ms = std::chrono::duration<double, std::milli>(end - slot.start).count();
                     ::close(slot.fd);
@@ -1349,6 +1380,7 @@ PollRunResult run_poll_clients(int port, int concurrency, int timeout_ms, PumpBe
     }
 
     run.cpu_end = bench::cpu_time();
+    run.thread_cpu_seconds = thread_cpu_seconds() - thread_cpu_start;
     run.wall_seconds = std::chrono::duration<double>(end - start).count();
     return run;
 }
@@ -1842,6 +1874,206 @@ int run_proxy_llm(int concurrency, int duration_s, int body_bytes, int workers, 
     return 0;
 }
 
+/// Upstream half of the gateway shape: a native realurl server answering every
+/// POST /events with `events` SSE events, one per interval_ms. Runs until killed.
+int run_sse_upstream(int port, int events, int interval_ms, int event_bytes, int io_threads)
+{
+    events = std::max(1, events);
+    interval_ms = std::max(0, interval_ms);
+    event_bytes = std::max(1, event_bytes);
+    io_threads = std::max(1, io_threads);
+
+    const auto event = std::make_shared<const std::string>("data: " + std::string(static_cast<std::size_t>(event_bytes), 'e') + "\n\n");
+
+    realurl::Server server;
+    server.set_io_threads(static_cast<unsigned>(io_threads));
+    server.set_read_header_timeout(0ms);
+    server.set_client_write_timeout(std::chrono::hours(1));
+    server.Get("/meta", [events](const realurl::Server::Request &, realurl::Server::Response &response) {
+        response.set_content(std::to_string(events), "text/plain");
+    });
+    server.Post("/events", [event, events, interval_ms](const realurl::Server::Request &request,
+                                                        realurl::Server::Response &response) {
+        response.take_over_task([event, events, interval_ms, &request](
+                                    realurl::server::StreamWriter &writer) -> realurl::Task<void> {
+            const realurl::server::Header headers[] = { { "content-type", "text/event-stream" } };
+            co_await writer.write_head(200, headers, std::nullopt);
+            for (int i = 0; i < events; ++i) {
+                if (i > 0 && interval_ms > 0)
+                    co_await request.loop->sleep_for(std::chrono::milliseconds(interval_ms));
+                if (!(co_await writer.write(*event)))
+                    co_return;
+            }
+            co_await writer.end();
+        });
+    }, { .body_mode = realurl::Server::BodyMode::Buffered });
+
+    std::printf("mode=sse_upstream port=%d events=%d interval_ms=%d event_bytes=%d io_threads=%d\n", port, events,
+                interval_ms, event_bytes, io_threads);
+    std::fflush(stdout);
+    return server.listen("127.0.0.1", port) ? 0 : 1;
+}
+
+/// Ask the upstream how many events a stream carries (GET /meta over plain
+/// HTTP/1.1). Returns -1 when the upstream is unreachable.
+int fetch_upstream_events(int port)
+{
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    const sockaddr_in address = loopback_address(port);
+    if (::connect(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    constexpr std::string_view request = "GET /meta HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n";
+    std::string reply;
+    char buffer[1024];
+    if (::send(fd, request.data(), request.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(request.size())) {
+        for (ssize_t n; (n = ::recv(fd, buffer, sizeof(buffer), 0)) > 0;)
+            reply.append(buffer, static_cast<std::size_t>(n));
+    }
+    ::close(fd);
+    const std::size_t split = reply.find("\r\n\r\n");
+    return split == std::string::npos ? -1 : std::atoi(reply.c_str() + split + 4);
+}
+
+/// Gateway shape: H1 clients -> proxy Server (StreamedNative, proxy_stream) ->
+/// native upstream (run in another process via sse_upstream). Reports per-stream
+/// memory and per-event CPU while every stream is held open.
+int run_gateway(int upstream_port, int concurrency, int body_bytes, int io_threads, int timeout_ms)
+{
+    concurrency = std::max(1, concurrency);
+    body_bytes = std::max(1, body_bytes);
+    io_threads = std::max(1, io_threads);
+    timeout_ms = std::max(1, timeout_ms);
+
+    const int events = fetch_upstream_events(upstream_port);
+    if (events <= 0) {
+        std::fprintf(stderr, "gateway: no sse_upstream on port %d\n", upstream_port);
+        return 1;
+    }
+
+    realurl::Config config;
+    config.protocol = realurl::Protocol::Native;
+    config.max_streams_per_conn = 1000;
+    config.max_conns_per_origin = (concurrency + 999) / 1000 + 1;
+    config.connect_timeout = 5s;
+
+    const int port = free_port();
+    if (port <= 0) {
+        std::fprintf(stderr, "gateway: cannot reserve a local port\n");
+        return 1;
+    }
+
+    const std::string upstream_url = "http://127.0.0.1:" + std::to_string(upstream_port) + "/events";
+    realurl::Server server;
+    server.set_io_threads(static_cast<unsigned>(io_threads));
+    server.set_upstream(config);
+    server.set_read_header_timeout(0ms);
+    server.set_client_write_timeout(std::chrono::milliseconds(timeout_ms));
+    server.Post("/proxy", [upstream_url](const realurl::Server::Request &request,
+                                         realurl::Server::Response &response) {
+        response.take_over_task([&request, upstream_url](realurl::server::StreamWriter &writer)
+                                    -> realurl::Task<void> {
+            co_await realurl::server::proxy_stream(*request.upstream, upstream_url, request, writer);
+        });
+    }, { .body_mode = realurl::Server::BodyMode::StreamedNative });
+
+    std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
+    for (int i = 0; i < 1000 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(1ms);
+    if (!server.is_running() || !wait_until_accepting(port)) {
+        server.stop();
+        listener.join();
+        std::fprintf(stderr, "gateway: server failed to start\n");
+        return 1;
+    }
+
+    const std::string client_body(static_cast<std::size_t>(body_bytes), 'u');
+    PumpBenchState state;
+    state.results.resize(static_cast<std::size_t>(concurrency));
+
+    std::atomic<bool> sampling{ true };
+    std::atomic<std::uint64_t> sampled_rss_max{ 0 };
+    std::thread sampler([&] {
+        auto next = std::chrono::steady_clock::now();
+        while (sampling.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() >= next) {
+                const std::uint64_t rss = bench::current_rss_bytes();
+                if (rss > sampled_rss_max.load(std::memory_order_relaxed))
+                    sampled_rss_max.store(rss, std::memory_order_relaxed);
+                next += 200ms;
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+    });
+
+    const std::uint64_t rss_before = bench::current_rss_bytes();
+    const PollRunResult run =
+        run_poll_clients(port, concurrency, timeout_ms, state, "/proxy", client_body, true);
+    sampling.store(false, std::memory_order_release);
+    sampler.join();
+    const std::uint64_t rss_peak = bench::peak_rss_bytes();
+
+    server.stop();
+    listener.join();
+
+    std::vector<double> ttft_ms;
+    std::vector<double> total_ms;
+    int short_streams = 0;
+    int first_short_events = -1;
+    for (const PumpClientResult &result : state.results) {
+        if (!result.ok)
+            continue;
+        if (result.events != events) {
+            ++short_streams;
+            if (first_short_events < 0)
+                first_short_events = result.events;
+            continue;
+        }
+        ttft_ms.push_back(result.ttft_ms);
+        total_ms.push_back(result.total_ms);
+    }
+
+    const int ok = static_cast<int>(ttft_ms.size());
+    const int failures = concurrency - ok;
+    const std::vector<double> pct_ttft = percentiles(ttft_ms);
+    const std::vector<double> pct_total = percentiles(total_ms);
+    const bench::CpuTime cpu_total{ run.cpu_end.user - run.cpu_start.user,
+                                    run.cpu_end.system - run.cpu_start.system };
+    const double proxy_cpu = cpu_total.total() - run.thread_cpu_seconds;
+    const double event_count = static_cast<double>(ok) * static_cast<double>(events);
+    const double peak_kb_per_stream =
+        static_cast<double>(rss_peak > rss_before ? rss_peak - rss_before : 0) / 1024.0 / concurrency;
+
+    std::printf("mode=gateway upstream_port=%d concurrency=%d events=%d body=%d io_threads=%d timeout_ms=%d\n",
+                upstream_port, concurrency, events, body_bytes, io_threads, timeout_ms);
+    std::printf("  status: %d ok, %d failed in %.2fs", ok, failures, run.wall_seconds);
+    if (failures > 0)
+        std::printf(" [connect=%d send=%d read=%d short=%d first: stage=%d errno=%d recv=%d events=%d]",
+                    state.connect_failures, state.send_failures, state.read_failures, short_streams,
+                    state.first_stage, state.first_errno, state.first_recv, first_short_events);
+    std::printf("\n");
+    if (!pct_ttft.empty())
+        std::printf("  ttft ms:  p50=%.1f p90=%.1f p95=%.1f p99=%.1f max=%.1f\n", pct_ttft[0], pct_ttft[1],
+                    pct_ttft[2], pct_ttft[3], pct_ttft[5]);
+    if (!pct_total.empty())
+        std::printf("  total ms: p50=%.1f p90=%.1f p95=%.1f p99=%.1f max=%.1f\n", pct_total[0], pct_total[1],
+                    pct_total[2], pct_total[3], pct_total[5]);
+    std::printf("  cpu: user=%.2fs sys=%.2fs total=%.2fs (clients=%.2fs proxy=%.2fs)\n", cpu_total.user,
+                cpu_total.system, cpu_total.total(), run.thread_cpu_seconds, proxy_cpu);
+    if (event_count > 0)
+        std::printf("  cpu per event: total=%.2fus proxy-only=%.2fus (%d events)\n",
+                    cpu_total.total() * 1e6 / event_count, proxy_cpu * 1e6 / event_count,
+                    static_cast<int>(event_count));
+    std::printf("  rss: before=%.1fMB peak=%.1fMB current=%.1fMB sampled-max=%.1fMB\n", megabytes(rss_before),
+                megabytes(rss_peak), megabytes(bench::current_rss_bytes()),
+                megabytes(sampled_rss_max.load(std::memory_order_relaxed)));
+    std::printf("  peak per stream: %.1fKB\n", peak_kb_per_stream);
+    return failures == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -1950,6 +2182,27 @@ int main(int argc, char **argv)
         const int body_bytes = argc > 4 ? std::atoi(argv[4]) : 2 * 1024 * 1024;
         return run_proxy_llm(concurrency, duration_s, body_bytes, 1, false, true);
     }
+    if (mode == "sse_upstream") {
+        // sse_upstream <port> <events> <interval_ms> <event_bytes> [io_threads]
+        if (argc < 6) {
+            std::fprintf(stderr, "usage: %s sse_upstream <port> <events> <interval_ms> <event_bytes> [io_threads]\n",
+                         argv[0]);
+            return 2;
+        }
+        return run_sse_upstream(std::atoi(argv[2]), std::atoi(argv[3]), std::atoi(argv[4]), std::atoi(argv[5]),
+                                argc > 6 ? std::atoi(argv[6]) : 1);
+    }
+    if (mode == "gateway") {
+        // gateway <upstream_port> <concurrency> [body_bytes] [io_threads] [timeout_ms]
+        if (argc < 4) {
+            std::fprintf(stderr,
+                         "usage: %s gateway <upstream_port> <concurrency> [body_bytes] [io_threads] [timeout_ms]\n",
+                         argv[0]);
+            return 2;
+        }
+        return run_gateway(std::atoi(argv[2]), std::atoi(argv[3]), argc > 4 ? std::atoi(argv[4]) : 2000,
+                           argc > 5 ? std::atoi(argv[5]) : 1, argc > 6 ? std::atoi(argv[6]) : 120000);
+    }
 
     std::fprintf(stderr,
                  "usage: %s requests <N> <concurrency> [connections] | requests_mt <N> <concurrency> <workers> "
@@ -1961,7 +2214,9 @@ int main(int argc, char **argv)
                  "| async <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| proxy <concurrency> [chunks] [interval_ms] [timeout_ms] [workers] [bridge|block] "
                  "| proxy_llm <concurrency> [duration_s] [body_bytes] [workers] [bridge|block] "
-                 "| proxy_inline <concurrency> [duration_s] [body_bytes]\n",
+                 "| proxy_inline <concurrency> [duration_s] [body_bytes] "
+                 "| sse_upstream <port> <events> <interval_ms> <event_bytes> [io_threads] "
+                 "| gateway <upstream_port> <concurrency> [body_bytes] [io_threads] [timeout_ms]\n",
                  argv[0]);
     return 2;
 }
