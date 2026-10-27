@@ -6,6 +6,7 @@
 #include "realurl/detail/hpack.hpp"
 #include "realurl/detail/protocol.hpp"
 #include "realurl/detail/socket.hpp"
+#include "realurl/detail/spill_queue.hpp"
 #include "realurl/detail/transport.hpp"
 #include "realurl/http2.hpp"
 
@@ -97,7 +98,8 @@ private:
 
 class H2StreamImpl : public std::enable_shared_from_this<H2StreamImpl> {
 public:
-    H2StreamImpl(H2Connection &connection, std::uint32_t id, std::uint32_t initial_window) noexcept;
+    H2StreamImpl(H2Connection &connection, std::uint32_t id, std::uint32_t initial_window,
+                 std::shared_ptr<const SpillConfig> spill) noexcept;
 
     std::uint32_t id() const noexcept
     {
@@ -153,6 +155,8 @@ private:
     void fail(int error);
     void check_closed();
     void flush_window();
+    /// SpillQueue ready callback: wakes a reader parked on an offloaded fetch.
+    static void on_spill_ready(void *context);
     std::size_t send_pending() const noexcept
     {
         return send_queue_.size();
@@ -179,8 +183,10 @@ private:
 
     ResponseHead head_result_;
 
-    ByteQueue recv_queue_;
+    SpillQueue recv_queue_;
     std::size_t recv_unacked_ = 0;
+    /// Unread bytes at which flush_window stops crediting the peer.
+    std::uint64_t recv_high_water_ = kRecvHighWater;
 
     ByteQueue send_queue_;
     std::int64_t send_window_ = kDefaultInitialWindowSize;
@@ -196,7 +202,8 @@ public:
     static Task<std::shared_ptr<H2Connection>> connect(
         EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority,
         std::string scheme, WireMode mode = WireMode::Http2, bool probe_native = false,
-        std::chrono::milliseconds probe_timeout = std::chrono::milliseconds{ 1000 });
+        std::chrono::milliseconds probe_timeout = std::chrono::milliseconds{ 1000 },
+        std::shared_ptr<const SpillConfig> spill = nullptr);
 
     std::shared_ptr<H2StreamImpl> open(std::string_view method, std::string_view path, HeaderList headers,
                                        bool end_stream,
@@ -248,7 +255,7 @@ public:
 
 private:
     H2Connection(EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority,
-                 std::string scheme, WireMode mode);
+                 std::string scheme, WireMode mode, std::shared_ptr<const SpillConfig> spill);
 
     Task<void> reader_loop();
     Task<void> writer_loop();
@@ -269,12 +276,16 @@ private:
 
     static constexpr std::uint32_t kConnRecvWindow = 16 * 1024 * 1024;
     static constexpr std::uint32_t kStreamRecvWindow = 4 * 1024 * 1024;
+    /// Twice the stream's WINDOW_UPDATE threshold, so credit always flows.
+    static constexpr std::uint32_t kMinSpillWindow = 64 * 1024;
 
     EventLoop &loop_;
     std::unique_ptr<Transport> transport_;
     std::string authority_;
     std::string scheme_;
     WireMode mode_ = WireMode::Http2;
+    /// Null when spilling is off.
+    std::shared_ptr<const SpillConfig> spill_;
 
     FrameParser parser_;
     HpackDecoder decoder_;

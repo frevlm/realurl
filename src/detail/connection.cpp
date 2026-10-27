@@ -302,12 +302,16 @@ private:
     bool done_ = false;
 };
 
-H2StreamImpl::H2StreamImpl(H2Connection &connection, std::uint32_t id, std::uint32_t initial_window) noexcept
+H2StreamImpl::H2StreamImpl(H2Connection &connection, std::uint32_t id, std::uint32_t initial_window,
+                           std::shared_ptr<const SpillConfig> spill) noexcept
     : connection_(&connection)
     , loop_(&connection.loop())
     , id_(id)
+    , recv_queue_(spill, loop_)
+    , recv_high_water_(spill != nullptr ? spill->limit : kRecvHighWater)
     , send_window_(initial_window)
 {
+    recv_queue_.set_ready_callback(&H2StreamImpl::on_spill_ready, this);
 }
 
 void H2StreamImpl::start_head(HeadAwaiter *waiter, std::coroutine_handle<> handle, std::chrono::milliseconds timeout)
@@ -339,7 +343,7 @@ void H2StreamImpl::complete_head(HeadAwaiter *waiter)
 
 void H2StreamImpl::start_read(ReadAwaiter *waiter, std::coroutine_handle<> handle)
 {
-    if (closed_ || error_ != 0) {
+    if ((closed_ || error_ != 0) && recv_queue_.empty()) {
         waiter->error_ = error_ != 0 ? error_ : ECANCELED;
         waiter->done_ = true;
         loop_->resume_later(handle);
@@ -434,10 +438,14 @@ Task<std::size_t> H2StreamImpl::read(std::span<char> buffer, std::chrono::millis
     if (buffer.empty())
         throw std::invalid_argument("h2 read: empty buffer");
 
-    if (!recv_queue_.empty()) {
+    while (!recv_queue_.empty()) {
         const std::size_t n = recv_queue_.read(buffer);
         flush_window();
-        co_return n;
+        if (n > 0)
+            co_return n;
+        // An offloaded spill is still fetching the next bytes from its store;
+        // on_spill_ready ends the wait.
+        co_await ReadAwaiter(*this, {}, idle);
     }
 
     if (error_ != 0)
@@ -457,10 +465,10 @@ Task<void> H2StreamImpl::read_all(std::string &out, std::chrono::milliseconds id
         }
         if (error_ != 0)
             throw std::system_error(error_, std::generic_category(), "h2 read");
-        if (remote_closed_ || closed_)
+        if ((remote_closed_ || closed_) && recv_queue_.empty())
             co_return;
-        // An empty buffer parks until data, END_STREAM or an error arrives;
-        // on_data queues the bytes for the next drain.
+        // An empty buffer parks until data, END_STREAM or an error arrives, or
+        // an offloaded spill fetched more; the next drain picks the bytes up.
         co_await ReadAwaiter(*this, {}, idle);
     }
 }
@@ -563,7 +571,7 @@ void H2StreamImpl::on_data(std::string_view data, bool end_stream, std::uint32_t
 
     recv_unacked_ += flow_bytes;
 
-    if (read_waiter_ != nullptr) {
+    if (read_waiter_ != nullptr && recv_queue_.empty()) {
         ReadAwaiter *waiter = read_waiter_;
         const std::size_t n = std::min(data.size(), waiter->buffer_.size());
         if (n > 0)
@@ -627,12 +635,26 @@ void H2StreamImpl::flush_window()
 {
     if (connection_ == nullptr || closed_)
         return;
-    if (recv_queue_.size() >= kRecvHighWater)
+    if (recv_queue_.size() >= recv_high_water_ || recv_queue_.throttled())
         return;
-    if (recv_unacked_ >= kWindowUpdateThreshold) {
-        connection_->send_window_update(id_, recv_unacked_);
-        recv_unacked_ = 0;
+    // Bytes bound for the spill store are credited once the store accepted
+    // them, so a store that falls behind holds the peer to one window.
+    const std::size_t held = std::min(recv_unacked_, recv_queue_.awaiting_store());
+    const std::size_t credit = recv_unacked_ - held;
+    if (credit >= kWindowUpdateThreshold) {
+        connection_->send_window_update(id_, static_cast<std::uint32_t>(credit));
+        recv_unacked_ = held;
     }
+}
+
+void H2StreamImpl::on_spill_ready(void *context)
+{
+    auto *stream = static_cast<H2StreamImpl *>(context);
+    stream->flush_window();
+    // Only spill waits park with an empty buffer while bytes are queued; a
+    // reader with a buffer is filled by on_data.
+    if (stream->read_waiter_ != nullptr && stream->read_waiter_->buffer_.empty())
+        stream->complete_read(stream->read_waiter_);
 }
 
 PumpResult H2StreamImpl::pump_one_frame()
@@ -732,22 +754,24 @@ void H2StreamImpl::check_closed()
 }
 
 H2Connection::H2Connection(EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority,
-                           std::string scheme, WireMode mode)
+                           std::string scheme, WireMode mode, std::shared_ptr<const SpillConfig> spill)
     : loop_(loop)
     , transport_(std::move(transport))
     , authority_(std::move(authority))
     , scheme_(std::move(scheme))
     , mode_(mode)
+    , spill_(std::move(spill))
     , flush_signal_(loop)
 {
 }
 
 Task<std::shared_ptr<H2Connection>> H2Connection::connect(
     EventLoop &loop, std::unique_ptr<Transport> transport, std::string authority, std::string scheme,
-    WireMode mode, bool probe_native, std::chrono::milliseconds probe_timeout)
+    WireMode mode, bool probe_native, std::chrono::milliseconds probe_timeout,
+    std::shared_ptr<const SpillConfig> spill)
 {
     std::shared_ptr<H2Connection> connection(new H2Connection(
-        loop, std::move(transport), std::move(authority), std::move(scheme), mode));
+        loop, std::move(transport), std::move(authority), std::move(scheme), mode, std::move(spill)));
     connection->send_preface();
 
     if (probe_native) {
@@ -768,10 +792,17 @@ Task<std::shared_ptr<H2Connection>> H2Connection::connect(
 
 void H2Connection::send_preface()
 {
+    // Spilling streams advertise a small window: the store, not the window,
+    // absorbs a slow reader's backlog. The connection window stays at
+    // kConnRecvWindow, credited on receipt, which is at least one stream
+    // window.
+    const std::uint32_t stream_window = spill_ != nullptr
+        ? std::clamp<std::uint32_t>(spill_->window, kMinSpillWindow, kConnRecvWindow)
+        : kStreamRecvWindow;
     if (mode_ == WireMode::Native) {
         write_buffer_.append(kNativePreface);
         const Setting settings[] = {
-            { kSettingInitialWindowSize, kStreamRecvWindow },
+            { kSettingInitialWindowSize, stream_window },
             { kSettingMaxFrameSize, kDefaultMaxFrameSize },
         };
         FrameWriter writer;
@@ -781,7 +812,7 @@ void H2Connection::send_preface()
         write_buffer_.append(kH2Preface);
         const Setting settings[] = {
             { kSettingEnablePush, 0 },
-            { kSettingInitialWindowSize, kStreamRecvWindow },
+            { kSettingInitialWindowSize, stream_window },
             { kSettingMaxFrameSize, kDefaultMaxFrameSize },
         };
         FrameWriter writer;
@@ -810,7 +841,7 @@ std::shared_ptr<H2StreamImpl> H2Connection::open(std::string_view method, std::s
     const std::uint32_t id = next_stream_id_;
     next_stream_id_ += 2;
 
-    auto stream = std::make_shared<H2StreamImpl>(*this, id, peer_initial_window_);
+    auto stream = std::make_shared<H2StreamImpl>(*this, id, peer_initial_window_, spill_);
     if (end_stream) {
         stream->local_closed_ = true;
         stream->end_sent_ = true;

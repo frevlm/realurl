@@ -1,0 +1,3 @@
+run_row: nproc=2 MemTotal:        2018160 kB kernel=7.0.14-linuxkit
+run_row: /build/bench/realurl_bench slow_reader 400 16 1024 0
+Killed

@@ -71,6 +71,11 @@ public:
         , resolver_(loop)
         , tls_context_(TlsContext::create(config_.ca_file, config_.protocol != Protocol::Http2))
     {
+        if (config_.spill_threshold > 0) {
+            spill_ = std::make_shared<const SpillConfig>(SpillConfig{
+                config_.spill_threshold, config_.spill_limit, config_.spill_dir, config_.spill_store,
+                config_.spill_offload, config_.spill_total_limit, config_.spill_window, config_.spill_threads });
+        }
     }
 
     Task<std::shared_ptr<H2Connection>> connection(const UrlParts &url, std::chrono::milliseconds timeout)
@@ -250,7 +255,7 @@ private:
 
             try {
                 std::shared_ptr<H2Connection> connection = co_await H2Connection::connect(
-                    *loop_, std::move(transport), url.authority(), url.scheme, mode, probe, probe_timeout);
+                    *loop_, std::move(transport), url.authority(), url.scheme, mode, probe, probe_timeout, spill_);
                 pool.wire_mode = mode;
                 pool.wire_mode_known = true;
                 co_return connection;
@@ -267,6 +272,8 @@ private:
     Config config_;
     Resolver resolver_;
     std::shared_ptr<TlsContext> tls_context_;
+    /// Shared by every stream; null when spilling is off.
+    std::shared_ptr<const SpillConfig> spill_;
     std::unordered_map<std::string, std::unique_ptr<OriginPool>, KeyHash, std::equal_to<>> pools_;
     std::string key_scratch_;
 };

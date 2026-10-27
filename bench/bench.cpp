@@ -1,4 +1,5 @@
 #include "resource.hpp"
+#include "spill_backends.hpp"
 #include "support/h2_test_server.hpp"
 #include "realurl/asio_bridge.hpp"
 #include "realurl/detail/tls.hpp"
@@ -1842,6 +1843,360 @@ int run_proxy_llm(int concurrency, int duration_s, int body_bytes, int workers, 
     return 0;
 }
 
+struct SlowReaderState
+{
+    realurl::Client *client = nullptr;
+    std::string url;
+    std::string_view pattern;
+    std::uint64_t response_bytes = 0;
+    double read_bytes_per_s = 0;
+    std::chrono::steady_clock::time_point start{};
+    int streams = 0;
+    int done = 0;
+    int failures = 0;
+    std::uint64_t delivered = 0;
+    std::vector<double> read_complete_s;
+    realurl::EventLoop *loop = nullptr;
+};
+
+/// One paced reader: 16 KiB reads, sleeping on the loop timer whenever it is
+/// ahead of read_bytes_per_s, and checking every byte against the pattern.
+realurl::Task<void> slow_reader_stream(SlowReaderState &state)
+{
+    std::uint64_t received = 0;
+    bool ok = false;
+    try {
+        realurl::Stream stream = co_await state.client->open("GET", state.url, {}, 30s);
+        co_await stream.end(30s);
+        const realurl::ResponseHead head = co_await stream.head(30s);
+        ok = head.status == 200;
+        const auto begin = std::chrono::steady_clock::now();
+        char buffer[16384];
+        while (ok) {
+            const std::size_t n = co_await stream.read({ buffer, sizeof(buffer) }, 120s);
+            if (n == 0)
+                break;
+            ok = received + n <= state.response_bytes &&
+                 std::memcmp(buffer, state.pattern.data() + received % 251, n) == 0;
+            received += n;
+
+            const auto due = begin + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                         std::chrono::duration<double>(received / state.read_bytes_per_s));
+            const auto now = std::chrono::steady_clock::now();
+            if (due > now)
+                co_await state.loop->sleep_for(due - now);
+        }
+        ok = ok && received == state.response_bytes;
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "slow_reader: stream failed after %llu bytes: %s\n",
+                     static_cast<unsigned long long>(received), error.what());
+        ok = false;
+    }
+
+    state.read_complete_s.push_back(
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count());
+    state.delivered += received;
+    if (!ok)
+        ++state.failures;
+    if (++state.done == state.streams)
+        state.loop->stop();
+}
+
+/// cgroup v2 memory counters for the bench's own cgroup, in bytes; -1 where
+/// unavailable (not Linux, or no cgroup v2 at /sys/fs/cgroup).
+struct CgroupMemory {
+    std::int64_t current = -1;
+    std::int64_t anon = -1;
+    std::int64_t file = -1;
+    std::int64_t sock = -1;
+
+    void keep_max(const CgroupMemory &other) noexcept
+    {
+        current = std::max(current, other.current);
+        anon = std::max(anon, other.anon);
+        file = std::max(file, other.file);
+        sock = std::max(sock, other.sock);
+    }
+};
+
+CgroupMemory read_cgroup_memory()
+{
+    CgroupMemory out;
+#if defined(__linux__)
+    if (FILE *current = std::fopen("/sys/fs/cgroup/memory.current", "r")) {
+        long long value = 0;
+        if (std::fscanf(current, "%lld", &value) == 1)
+            out.current = value;
+        std::fclose(current);
+    }
+    if (FILE *stat = std::fopen("/sys/fs/cgroup/memory.stat", "r")) {
+        char key[64];
+        long long value = 0;
+        while (std::fscanf(stat, "%63s %lld", key, &value) == 2) {
+            const std::string_view name = key;
+            if (name == "anon")
+                out.anon = value;
+            else if (name == "file")
+                out.file = value;
+            else if (name == "sock")
+                out.sock = value;
+        }
+        std::fclose(stat);
+    }
+#endif
+    return out;
+}
+
+/// cgroup bytes as MiB, or -1 when the counter is unavailable.
+double cgroup_mb(std::int64_t bytes)
+{
+    return bytes < 0 ? -1.0 : megabytes(static_cast<std::uint64_t>(bytes));
+}
+
+/// Fires every 10 ms on the client loop and records how late it ran, so
+/// store I/O that blocks the loop shows up as a stall.
+struct LoopStallProbe {
+    static constexpr std::chrono::milliseconds kPeriod{ 10 };
+
+    realurl::EventLoop *loop = nullptr;
+    realurl::detail::TimerNode node;
+    std::chrono::steady_clock::time_point due{};
+    double max_ms = 0;
+
+    void start(realurl::EventLoop &on)
+    {
+        loop = &on;
+        due = std::chrono::steady_clock::now() + kPeriod;
+        loop->schedule(node, kPeriod, &LoopStallProbe::fire, this);
+    }
+
+    void stop()
+    {
+        if (loop != nullptr)
+            loop->cancel(node);
+    }
+
+    static void fire(void *context)
+    {
+        auto *probe = static_cast<LoopStallProbe *>(context);
+        const auto now = std::chrono::steady_clock::now();
+        probe->max_ms = std::max(probe->max_ms, std::chrono::duration<double, std::milli>(now - probe->due).count());
+        probe->due = now + kPeriod;
+        probe->loop->schedule(probe->node, kPeriod, &LoopStallProbe::fire, probe);
+    }
+};
+
+struct SlowReaderOptions {
+    int streams = 50;
+    int response_mib = 32;
+    int read_kib_per_s = 2048;
+    int threshold_kib = 0;
+    /// "file" for the built-in temporary file, else a bench::make_spill_store
+    /// backend.
+    std::string store = "file";
+    bool offload = false;
+    /// spill_dir for "file", else the backend argument.
+    std::string store_arg;
+    int total_limit_mib = 0;
+    int threads = 2;
+    int window_kib = 256;
+};
+
+/// Fast upstream, slow consumer: an in-process Server writes `response_mib`
+/// MiB per stream as fast as flow control allows while each client stream
+/// reads at `read_kib_per_s`. Compares when the upstream finished sending
+/// against when the reader finished, and the client-side memory that cost.
+/// Ends with one machine-readable RESULT line.
+int run_slow_reader(const SlowReaderOptions &options)
+{
+    int streams = options.streams;
+    int response_mib = options.response_mib;
+    int read_kib_per_s = options.read_kib_per_s;
+    int spill_threshold_kib = options.threshold_kib;
+
+    realurl::SpillStoreFactory store_factory;
+    if (options.store != "file") {
+        store_factory = bench::make_spill_store(options.store, options.store_arg);
+        if (!store_factory) {
+            std::fprintf(stderr, "slow_reader: spill store '%s' is not available\n", options.store.c_str());
+            return 2;
+        }
+    }
+
+    streams = std::max(1, streams);
+    response_mib = std::max(1, response_mib);
+    read_kib_per_s = std::max(1, read_kib_per_s);
+    spill_threshold_kib = std::max(0, spill_threshold_kib);
+    const std::uint64_t response_bytes = static_cast<std::uint64_t>(response_mib) * 1024 * 1024;
+    constexpr std::size_t kWrite = 64 * 1024;
+
+    // pattern[k] == k % 251 for k < kWrite + 251, so any offset's next kWrite
+    // bytes are pattern.substr(offset % 251, kWrite).
+    std::string pattern_storage(kWrite + 251, '\0');
+    for (std::size_t i = 0; i < pattern_storage.size(); ++i)
+        pattern_storage[i] = static_cast<char>(i % 251);
+    const std::string_view pattern = pattern_storage;
+
+    const int port = free_port();
+    if (port <= 0) {
+        std::fprintf(stderr, "slow_reader: cannot reserve a local port\n");
+        return 1;
+    }
+
+    std::mutex send_mutex;
+    std::vector<std::chrono::steady_clock::time_point> send_complete;
+    send_complete.reserve(static_cast<std::size_t>(streams));
+
+    realurl::Server server;
+    server.set_io_threads(1);
+    server.set_client_write_timeout(600s);
+    server.Get("/hello", [](const auto &, auto &response) { response.set_content("world"); });
+    server.Get("/big", [&](const realurl::Server::Request &, realurl::Server::Response &response) {
+        response.take_over_task([&, response_bytes, pattern](realurl::server::StreamWriter &writer) -> realurl::Task<void> {
+            co_await writer.write_head(200, {}, response_bytes);
+            for (std::uint64_t offset = 0; offset < response_bytes;) {
+                const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(kWrite, response_bytes - offset));
+                if (!co_await writer.write(pattern.substr(offset % 251, n)))
+                    co_return;
+                offset += n;
+            }
+            co_await writer.end();
+            std::lock_guard<std::mutex> lock(send_mutex);
+            send_complete.push_back(std::chrono::steady_clock::now());
+        });
+    });
+
+    std::thread listener([&] { (void)server.listen("127.0.0.1", port); });
+    for (int i = 0; i < 1000 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(1ms);
+    if (!server.is_running()) {
+        server.stop();
+        listener.join();
+        std::fprintf(stderr, "slow_reader: server failed to start\n");
+        return 1;
+    }
+
+    realurl::EventLoop loop;
+    realurl::Config config;
+    config.protocol = realurl::Protocol::Native;
+    config.max_streams_per_conn = streams;
+    config.max_conns_per_origin = 1;
+    config.spill_threshold = static_cast<std::size_t>(spill_threshold_kib) * 1024;
+    config.spill_store = std::move(store_factory);
+    if (options.store == "file")
+        config.spill_dir = options.store_arg;
+    config.spill_offload = options.offload;
+    config.spill_total_limit = static_cast<std::uint64_t>(std::max(0, options.total_limit_mib)) * 1024 * 1024;
+    config.spill_threads = options.threads;
+    config.spill_window = static_cast<std::uint32_t>(std::max(0, options.window_kib)) * 1024;
+    realurl::Client client(loop, config);
+    const std::string base = "http://127.0.0.1:" + std::to_string(port);
+
+    SlowReaderState state;
+    state.client = &client;
+    state.url = base + "/big";
+    state.pattern = pattern;
+    state.response_bytes = response_bytes;
+    state.read_bytes_per_s = static_cast<double>(read_kib_per_s) * 1024.0;
+    state.streams = streams;
+    state.loop = &loop;
+    state.read_complete_s.reserve(static_cast<std::size_t>(streams));
+
+    std::uint64_t rss_before = 0;
+    bench::CpuTime cpu_start{};
+    std::atomic<bool> sampling{ true };
+    std::atomic<std::uint64_t> rss_sampled_max{ 0 };
+    CgroupMemory cg_max;
+    LoopStallProbe stall;
+    std::thread sampler;
+
+    auto driver = [&]() -> realurl::Task<void> {
+        try {
+            (void)co_await client.get(base + "/hello", 30s);
+        } catch (const std::exception &error) {
+            std::fprintf(stderr, "slow_reader: warmup failed: %s\n", error.what());
+            state.failures = streams;
+            loop.stop();
+            co_return;
+        }
+        rss_before = bench::current_rss_bytes();
+        rss_sampled_max.store(rss_before, std::memory_order_relaxed);
+        sampler = std::thread([&] {
+            while (sampling.load(std::memory_order_relaxed)) {
+                const std::uint64_t rss = bench::current_rss_bytes();
+                if (rss > rss_sampled_max.load(std::memory_order_relaxed))
+                    rss_sampled_max.store(rss, std::memory_order_relaxed);
+                cg_max.keep_max(read_cgroup_memory());
+                std::this_thread::sleep_for(200ms);
+            }
+        });
+        stall.start(loop);
+        cpu_start = bench::cpu_time();
+        state.start = std::chrono::steady_clock::now();
+        for (int i = 0; i < streams; ++i)
+            loop.spawn(slow_reader_stream(state));
+    };
+    loop.spawn(driver());
+    loop.run();
+    stall.stop();
+
+    const bench::CpuTime cpu_end = bench::cpu_time();
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count();
+    sampling.store(false, std::memory_order_relaxed);
+    if (sampler.joinable())
+        sampler.join();
+
+    std::vector<double> send_complete_s;
+    {
+        std::lock_guard<std::mutex> lock(send_mutex);
+        for (const auto &when : send_complete)
+            send_complete_s.push_back(std::chrono::duration<double>(when - state.start).count());
+    }
+    const std::vector<double> pct_send = percentiles(send_complete_s);
+    const std::vector<double> pct_read = percentiles(state.read_complete_s);
+    const std::uint64_t rss_delta = rss_sampled_max.load() > rss_before ? rss_sampled_max.load() - rss_before : 0;
+    const double cpu_total = cpu_end.total() - cpu_start.total();
+    const double delivered_mib = megabytes(state.delivered);
+
+    std::printf("mode=slow_reader protocol=native streams=%d response=%dMiB read=%dKiB/s spill_threshold=%dKiB "
+                "store=%s offload=%d total_limit=%dMiB threads=%d window=%dKiB\n",
+                streams, response_mib, read_kib_per_s, spill_threshold_kib, options.store.c_str(),
+                options.offload ? 1 : 0, std::max(0, options.total_limit_mib), options.threads, options.window_kib);
+    std::printf("  status: %s (%d/%d streams ok, %.1f MiB delivered) in %.2fs\n",
+                state.failures == 0 ? "ok" : "failed", streams - state.failures, streams, delivered_mib, wall);
+    if (!pct_send.empty())
+        std::printf("  upstream send-complete s: p50=%.2f max=%.2f (%zu streams)\n", pct_send[0], pct_send[5],
+                    send_complete_s.size());
+    if (!pct_read.empty())
+        std::printf("  client read-complete s:   p50=%.2f max=%.2f\n", pct_read[0], pct_read[5]);
+    std::printf("  rss: before=%.1fMB peak=%.1fMB sampled_max=%.1fMB delta=%.1fMB per-stream=%.0fKB\n",
+                megabytes(rss_before), megabytes(bench::peak_rss_bytes()), megabytes(rss_sampled_max.load()),
+                megabytes(rss_delta), static_cast<double>(rss_delta) / 1024.0 / streams);
+    std::printf("  cpu: user=%.2fs sys=%.2fs total=%.2fs (%.3f ms/MiB)\n", cpu_end.user - cpu_start.user,
+                cpu_end.system - cpu_start.system, cpu_total,
+                delivered_mib > 0 ? cpu_total * 1000.0 / delivered_mib : 0.0);
+    std::printf("  cgroup max MB: memory=%.1f anon=%.1f file=%.1f sock=%.1f\n", cgroup_mb(cg_max.current),
+                cgroup_mb(cg_max.anon), cgroup_mb(cg_max.file), cgroup_mb(cg_max.sock));
+    std::printf("  client loop stall max: %.1f ms\n", stall.max_ms);
+    std::printf("RESULT streams=%d mib=%d read_kibps=%d threshold_kib=%d store=%s offload=%d threads=%d "
+                "window_kib=%d ok=%d failed=%d "
+                "upstream_done_p50_s=%.2f upstream_done_max_s=%.2f read_done_p50_s=%.2f read_done_max_s=%.2f "
+                "rss_delta_mb=%.1f rss_kb_per_stream=%.0f cpu_s=%.2f cpu_ms_per_mib=%.3f cg_mem_max_mb=%.1f "
+                "cg_anon_max_mb=%.1f cg_file_max_mb=%.1f cg_sock_max_mb=%.1f loop_stall_max_ms=%.1f\n",
+                streams, response_mib, read_kib_per_s, spill_threshold_kib, options.store.c_str(),
+                options.offload ? 1 : 0, options.threads, options.window_kib, streams - state.failures, state.failures,
+                pct_send.empty() ? -1.0 : pct_send[0], pct_send.empty() ? -1.0 : pct_send[5],
+                pct_read.empty() ? -1.0 : pct_read[0], pct_read.empty() ? -1.0 : pct_read[5], megabytes(rss_delta),
+                static_cast<double>(rss_delta) / 1024.0 / streams, cpu_total,
+                delivered_mib > 0 ? cpu_total * 1000.0 / delivered_mib : 0.0, cgroup_mb(cg_max.current),
+                cgroup_mb(cg_max.anon), cgroup_mb(cg_max.file), cgroup_mb(cg_max.sock), stall.max_ms);
+
+    client.close();
+    server.stop();
+    listener.join();
+    return state.failures == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -1951,6 +2306,33 @@ int main(int argc, char **argv)
         return run_proxy_llm(concurrency, duration_s, body_bytes, 1, false, true);
     }
 
+    if (mode == "slow_reader") {
+        // slow_reader <streams> <response_mib> <read_kib_per_s> <threshold_kib> [store=file] [offload=0]
+        //             [store_arg=] [total_limit_mib=0] [threads=2] [window_kib=256]
+        SlowReaderOptions options;
+        if (argc > 2)
+            options.streams = std::atoi(argv[2]);
+        if (argc > 3)
+            options.response_mib = std::atoi(argv[3]);
+        if (argc > 4)
+            options.read_kib_per_s = std::atoi(argv[4]);
+        if (argc > 5)
+            options.threshold_kib = std::atoi(argv[5]);
+        if (argc > 6)
+            options.store = argv[6];
+        if (argc > 7)
+            options.offload = std::atoi(argv[7]) != 0;
+        if (argc > 8)
+            options.store_arg = argv[8];
+        if (argc > 9)
+            options.total_limit_mib = std::atoi(argv[9]);
+        if (argc > 10)
+            options.threads = std::atoi(argv[10]);
+        if (argc > 11)
+            options.window_kib = std::atoi(argv[11]);
+        return run_slow_reader(options);
+    }
+
     std::fprintf(stderr,
                  "usage: %s requests <N> <concurrency> [connections] | requests_mt <N> <concurrency> <workers> "
                  "[connections] | h2_unary|native_unary <N> <concurrency> <workers> [h2|native] | hold <streams> | llm <total> <concurrency> [duration_s] [streaming] [connections] "
@@ -1961,7 +2343,9 @@ int main(int argc, char **argv)
                  "| async <concurrency> [chunks] [interval_ms] [timeout_ms] "
                  "| proxy <concurrency> [chunks] [interval_ms] [timeout_ms] [workers] [bridge|block] "
                  "| proxy_llm <concurrency> [duration_s] [body_bytes] [workers] [bridge|block] "
-                 "| proxy_inline <concurrency> [duration_s] [body_bytes]\n",
+                 "| proxy_inline <concurrency> [duration_s] [body_bytes] "
+                 "| slow_reader <streams> <response_mib> <read_kib_per_s> <threshold_kib> [store=file|sqlite|postgres] "
+                 "[offload=0] [store_arg=] [total_limit_mib=0] [threads=2] [window_kib=256]\n",
                  argv[0]);
     return 2;
 }

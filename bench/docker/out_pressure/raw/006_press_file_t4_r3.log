@@ -1,0 +1,11 @@
+run_row: nproc=2 MemTotal:        2018160 kB kernel=7.0.14-linuxkit
+run_row: /build/bench/realurl_bench slow_reader 400 16 1024 256 file 1 /var/tmp/spill 0 4
+mode=slow_reader protocol=native streams=400 response=16MiB read=1024KiB/s spill_threshold=256KiB store=file offload=1 total_limit=0MiB threads=4 window=256KiB
+  status: ok (400/400 streams ok, 6400.0 MiB delivered) in 16.05s
+  upstream send-complete s: p50=7.09 max=7.18 (400 streams)
+  client read-complete s:   p50=16.05 max=16.05
+  rss: before=12.6MB peak=374.5MB sampled_max=373.8MB delta=361.2MB per-stream=925KB
+  cpu: user=4.05s sys=8.10s total=12.15s (1.899 ms/MiB)
+  cgroup max MB: memory=1390.6 anon=364.1 file=1104.0 sock=16.1
+  client loop stall max: 98.6 ms
+RESULT streams=400 mib=16 read_kibps=1024 threshold_kib=256 store=file offload=1 threads=4 window_kib=256 ok=400 failed=0 upstream_done_p50_s=7.09 upstream_done_max_s=7.18 read_done_p50_s=16.05 read_done_max_s=16.05 rss_delta_mb=361.2 rss_kb_per_stream=925 cpu_s=12.15 cpu_ms_per_mib=1.899 cg_mem_max_mb=1390.6 cg_anon_max_mb=364.1 cg_file_max_mb=1104.0 cg_sock_max_mb=16.1 loop_stall_max_ms=98.6

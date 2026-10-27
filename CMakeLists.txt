@@ -80,6 +80,7 @@ add_library(realurl_core
   src/detail/native_codec.cpp
   src/detail/url.cpp
   src/detail/connection.cpp
+  src/detail/spill_queue.cpp
   src/detail/client.cpp
   src/detail/client_group.cpp
   src/detail/tls.cpp

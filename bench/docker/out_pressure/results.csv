@@ -1,0 +1,16 @@
+label,run,status,exit,wall_s,pg_cpu_max,pg_mem_max_mb,pg_mem_before_mb,pg_mem_after_mb,args,streams,mib,read_kibps,threshold_kib,store,offload,threads,window_kib,ok,failed,upstream_done_p50_s,upstream_done_max_s,read_done_p50_s,read_done_max_s,rss_delta_mb,rss_kb_per_stream,cpu_s,cpu_ms_per_mib,cg_mem_max_mb,cg_anon_max_mb,cg_file_max_mb,cg_sock_max_mb,loop_stall_max_ms
+press_nospill,1,oom,137,13,,,,,slow_reader 400 16 1024 0,,,,,,,,,,,,,,,,,,,,,,,
+press_nospill,2,oom,137,16,,,,,slow_reader 400 16 1024 0,,,,,,,,,,,,,,,,,,,,,,,
+press_nospill,3,ok,0,18,,,,,slow_reader 400 16 1024 0,400,16,1024,0,file,0,2,256,400,0,16.99,17.00,16.99,17.00,1676.3,4291,8.11,1.267,1742.5,1687.8,23.7,16.3,2467.2
+press_file_t4,1,ok,0,17,,,,,slow_reader 400 16 1024 256 file 1 /var/tmp/spill 0 4,400,16,1024,256,file,1,4,256,400,0,8.32,8.53,16.02,16.03,359.8,921,11.63,1.817,1465.6,363.5,1170.6,11.8,45.7
+press_file_t4,2,ok,0,17,,,,,slow_reader 400 16 1024 256 file 1 /var/tmp/spill 0 4,400,16,1024,256,file,1,4,256,400,0,7.09,7.30,16.05,16.05,378.1,968,10.96,1.712,1411.7,381.0,1127.9,12.2,86.6
+press_file_t4,3,ok,0,16,,,,,slow_reader 400 16 1024 256 file 1 /var/tmp/spill 0 4,400,16,1024,256,file,1,4,256,400,0,7.09,7.18,16.05,16.05,361.2,925,12.15,1.899,1390.6,364.1,1104.0,16.1,98.6
+press_volume_t4,1,ok,0,17,,,,,slow_reader 400 16 1024 256 file 1 /spill/run 0 4,400,16,1024,256,file,1,4,256,400,0,6.85,6.92,16.05,16.05,338.8,867,11.38,1.779,1380.7,341.5,1144.7,11.8,34.2
+press_volume_t4,2,ok,0,16,,,,,slow_reader 400 16 1024 256 file 1 /spill/run 0 4,400,16,1024,256,file,1,4,256,400,0,8.33,8.78,16.03,16.03,361.6,926,12.59,1.966,1314.8,364.5,1089.9,17.0,63.1
+press_volume_t4,3,ok,0,16,,,,,slow_reader 400 16 1024 256 file 1 /spill/run 0 4,400,16,1024,256,file,1,4,256,400,0,9.00,9.12,16.04,16.04,343.9,880,11.90,1.860,1316.3,346.5,1019.3,11.3,85.8
+press_tmpfs_t4,1,ok,0,17,,,,,slow_reader 400 16 1024 256 file 1 /spilltmp/run 0 4,400,16,1024,256,file,1,4,256,400,0,15.65,15.80,16.05,16.07,453.6,1161,8.32,1.300,1348.3,459.6,986.4,12.1,39.9
+press_tmpfs_t4,2,ok,0,16,,,,,slow_reader 400 16 1024 256 file 1 /spilltmp/run 0 4,400,16,1024,256,file,1,4,256,400,0,15.68,15.68,16.03,16.03,456.6,1169,8.08,1.262,1422.1,460.1,992.7,6.2,71.1
+press_tmpfs_t4,3,ok,0,16,,,,,slow_reader 400 16 1024 256 file 1 /spilltmp/run 0 4,400,16,1024,256,file,1,4,256,400,0,15.60,15.77,16.03,16.03,463.2,1186,7.99,1.249,1403.3,467.3,988.4,9.4,16.0
+press_sqlite_t4,1,ok,0,57,,,,,slow_reader 400 16 1024 256 sqlite 1 /var/tmp/spill 0 4,400,16,1024,256,sqlite,1,4,256,400,0,23.22,23.59,56.75,56.77,675.2,1728,44.55,6.961,1651.4,677.1,1134.5,1.0,51.6
+press_sqlite_t4,2,ok,0,54,,,,,slow_reader 400 16 1024 256 sqlite 1 /var/tmp/spill 0 4,400,16,1024,256,sqlite,1,4,256,400,0,23.73,24.62,52.97,52.99,689.9,1766,41.72,6.519,1740.2,691.6,1205.2,0.5,17.9
+press_sqlite_t4,3,ok,0,63,,,,,slow_reader 400 16 1024 256 sqlite 1 /var/tmp/spill 0 4,400,16,1024,256,sqlite,1,4,256,400,0,23.13,23.80,61.68,61.70,677.4,1734,44.48,6.951,1630.3,679.1,1142.6,4.0,16.8

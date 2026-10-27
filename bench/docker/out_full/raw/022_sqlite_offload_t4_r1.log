@@ -1,0 +1,11 @@
+run_row: nproc=2 MemTotal:        2018160 kB kernel=7.0.14-linuxkit
+run_row: /build/bench/realurl_bench slow_reader 100 8 512 256 sqlite 1 /var/tmp/spill 0 4
+mode=slow_reader protocol=native streams=100 response=8MiB read=512KiB/s spill_threshold=256KiB store=sqlite offload=1 total_limit=0MiB threads=4 window=256KiB
+  status: ok (100/100 streams ok, 800.0 MiB delivered) in 16.02s
+  upstream send-complete s: p50=1.20 max=1.25 (100 streams)
+  client read-complete s:   p50=16.02 max=16.02
+  rss: before=12.6MB peak=378.9MB sampled_max=376.8MB delta=364.2MB per-stream=3730KB
+  cpu: user=2.71s sys=3.38s total=6.09s (7.614 ms/MiB)
+  cgroup max MB: memory=1117.2 anon=365.9 file=760.2 sock=0.0
+  client loop stall max: 25.7 ms
+RESULT streams=100 mib=8 read_kibps=512 threshold_kib=256 store=sqlite offload=1 threads=4 window_kib=256 ok=100 failed=0 upstream_done_p50_s=1.20 upstream_done_max_s=1.25 read_done_p50_s=16.02 read_done_max_s=16.02 rss_delta_mb=364.2 rss_kb_per_stream=3730 cpu_s=6.09 cpu_ms_per_mib=7.614 cg_mem_max_mb=1117.2 cg_anon_max_mb=365.9 cg_file_max_mb=760.2 cg_sock_max_mb=0.0 loop_stall_max_ms=25.7

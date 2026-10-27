@@ -1,0 +1,40 @@
+# label  args...   (args go to realurl_bench verbatim after placeholder expansion)
+#
+# slow_reader <streams> <response_mib> <read_kib_per_s> <threshold_kib>
+#   [store=file|sqlite|sqlite_mt|postgres] [offload=0|1] [store_arg]
+#   [total_limit_mib=0] [threads=2] [window_kib=256]
+# threshold_kib=0 -> no spilling (baseline).
+#
+# Placeholders (each expands to ONE argument):
+#   @OVERLAY@  /var/tmp/spill   container overlay fs
+#   @VOL@      /spill/run       named docker volume (real disk)
+#   @TMPFS@    /spilltmp/run    tmpfs (memory-backed: watch cg_file/shmem)
+#   @PG@       postgres conninfo of the spill-pg container
+#
+# Workload: 100 streams x 8 MiB read at 512 KiB/s (~16 s), spill threshold 256 KiB.
+
+base_nospill        slow_reader 100 8 512 0
+file_sync           slow_reader 100 8 512 256 file 0 @OVERLAY@
+file_offload        slow_reader 100 8 512 256 file 1 @OVERLAY@
+file_offload_t4     slow_reader 100 8 512 256 file 1 @OVERLAY@ 0 4
+
+# spill directory: overlay vs volume vs tmpfs (threads 4)
+dir_overlay_t4      slow_reader 100 8 512 256 file 1 @OVERLAY@ 0 4
+dir_volume_t4       slow_reader 100 8 512 256 file 1 @VOL@ 0 4
+dir_tmpfs_t4        slow_reader 100 8 512 256 file 1 @TMPFS@ 0 4
+
+sqlite_offload_t4   slow_reader 100 8 512 256 sqlite 1 @OVERLAY@ 0 4
+sqlitemt_offload_t4 slow_reader 100 8 512 256 sqlite_mt 1 @OVERLAY@ 0 4
+postgres_offload_t4 slow_reader 100 8 512 256 postgres 1 @PG@ 0 4
+
+# total spill cap 200 MiB
+cap200_file_t4      slow_reader 100 8 512 256 file 1 @OVERLAY@ 200 4
+
+# stream window 64 / 256 / 1024 KiB
+win64_file_t4       slow_reader 100 8 512 256 file 1 @OVERLAY@ 0 4 64
+win256_file_t4      slow_reader 100 8 512 256 file 1 @OVERLAY@ 0 4 256
+win1024_file_t4     slow_reader 100 8 512 256 file 1 @OVERLAY@ 0 4 1024
+
+# heavy: 200 streams x 16 MiB (3.2 GB) at 1024 KiB/s. Does no-spill OOM in 2 GB?
+heavy_nospill       slow_reader 200 16 1024 0
+heavy_file_offload  slow_reader 200 16 1024 256 file 1 @OVERLAY@ 0 4

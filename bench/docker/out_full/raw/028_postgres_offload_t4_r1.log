@@ -1,0 +1,11 @@
+run_row: nproc=2 MemTotal:        2018160 kB kernel=7.0.14-linuxkit
+run_row: /build/bench/realurl_bench slow_reader 100 8 512 256 postgres 1 host=host.docker.internal port=55432 user=postgres password=bench dbname=postgres 0 4
+mode=slow_reader protocol=native streams=100 response=8MiB read=512KiB/s spill_threshold=256KiB store=postgres offload=1 total_limit=0MiB threads=4 window=256KiB
+  status: ok (100/100 streams ok, 800.0 MiB delivered) in 16.01s
+  upstream send-complete s: p50=2.46 max=2.54 (100 streams)
+  client read-complete s:   p50=16.01 max=16.01
+  rss: before=13.6MB peak=107.1MB sampled_max=107.2MB delta=93.7MB per-stream=959KB
+  cpu: user=0.94s sys=1.72s total=2.65s (3.316 ms/MiB)
+  cgroup max MB: memory=98.5 anon=96.4 file=0.5 sock=0.5
+  client loop stall max: 11.1 ms
+RESULT streams=100 mib=8 read_kibps=512 threshold_kib=256 store=postgres offload=1 threads=4 window_kib=256 ok=100 failed=0 upstream_done_p50_s=2.46 upstream_done_max_s=2.54 read_done_p50_s=16.01 read_done_max_s=16.01 rss_delta_mb=93.7 rss_kb_per_stream=959 cpu_s=2.65 cpu_ms_per_mib=3.316 cg_mem_max_mb=98.5 cg_anon_max_mb=96.4 cg_file_max_mb=0.5 cg_sock_max_mb=0.5 loop_stall_max_ms=11.1

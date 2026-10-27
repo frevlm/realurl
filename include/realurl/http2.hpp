@@ -9,6 +9,7 @@
 
 #include "realurl/detail/event_loop.hpp"
 #include "realurl/detail/http2_types.hpp"
+#include "realurl/spill_store.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -59,6 +60,45 @@ struct Config {
     /// Auto prefers the realurl native transport and falls back to HTTP/2.
     /// Http2 disables native negotiation entirely. Native requires it.
     Protocol protocol = Protocol::Auto;
+
+    /// Response bytes a stream keeps in memory before the backlog of unread
+    /// data spills to its spill store (a temporary file by default). 0 never
+    /// spills: the backlog stays in memory and the peer is throttled once
+    /// about 1 MiB is unread.
+    std::size_t spill_threshold = 0;
+
+    /// With spilling enabled, total unread bytes (memory + store) per stream
+    /// at which the peer is throttled.
+    std::uint64_t spill_limit = 256ull * 1024 * 1024;
+
+    /// Directory for spill files. Empty uses $TMPDIR, else /tmp.
+    std::string spill_dir;
+
+    /// Creates each spilling stream's store. Empty uses the built-in
+    /// temporary file in spill_dir.
+    SpillStoreFactory spill_store;
+
+    /// Run store calls on a process-wide helper thread instead of the loop
+    /// thread, so a slow store never stalls the loop. Reads then wait for the
+    /// helper to fetch spilled bytes back.
+    bool spill_offload = false;
+
+    /// Bytes held in spill stores across the whole process, shared by every
+    /// client; 0 is unlimited. A stream whose spill would exceed it keeps the
+    /// bytes in memory and throttles its peer until its backlog drains below
+    /// spill_threshold.
+    std::uint64_t spill_total_limit = 0;
+
+    /// With spilling enabled, the receive window each stream advertises
+    /// (clamped to 64 KiB .. 16 MiB) instead of the default 4 MiB. Bytes bound
+    /// for the store are credited back once the store accepted them, so
+    /// unread memory per stream stays near spill_threshold + spill_window.
+    std::uint32_t spill_window = 256 * 1024;
+
+    /// Helper threads for spill_offload, shared by the whole process. The
+    /// first offloaded spill starts them with its client's count; later
+    /// values are ignored.
+    int spill_threads = 2;
 };
 
 namespace detail

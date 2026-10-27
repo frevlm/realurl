@@ -1,0 +1,10 @@
+label=press_sqlite_t4
+run=1
+status=ok
+exit=0
+wall_s=57
+pg_cpu_max=
+pg_mem_max_mb=
+pg_mem_before_mb=
+pg_mem_after_mb=
+args=slow_reader 400 16 1024 256 sqlite 1 /var/tmp/spill 0 4

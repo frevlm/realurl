@@ -11,6 +11,9 @@ target_link_libraries(realurl_test_support PUBLIC realurl::core OpenSSL::SSL Ope
 
 realurl_add_test(buffer_pool_test)
 realurl_add_test(byte_queue_test)
+realurl_add_test(spill_queue_test)
+realurl_add_test(spill_stream_test)
+target_link_libraries(spill_stream_test PRIVATE realurl::server)
 realurl_add_test(body_feeder_test)
 realurl_add_test(rate_limit_test)
 realurl_add_test(pump_pool_test)

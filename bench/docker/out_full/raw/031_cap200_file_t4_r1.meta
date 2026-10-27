@@ -1,0 +1,10 @@
+label=cap200_file_t4
+run=1
+status=ok
+exit=0
+wall_s=16
+pg_cpu_max=
+pg_mem_max_mb=
+pg_mem_before_mb=
+pg_mem_after_mb=
+args=slow_reader 100 8 512 256 file 1 /var/tmp/spill 200 4

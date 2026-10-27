@@ -1,0 +1,6 @@
+# 400 streams x 16 MiB at 1 MiB/s: about 2x the heavy row, expected to exceed 2 GB without spilling.
+press_nospill        slow_reader 400 16 1024 0
+press_file_t4        slow_reader 400 16 1024 256 file 1 @OVERLAY@ 0 4
+press_volume_t4      slow_reader 400 16 1024 256 file 1 @VOL@ 0 4
+press_tmpfs_t4       slow_reader 400 16 1024 256 file 1 @TMPFS@ 0 4
+press_sqlite_t4      slow_reader 400 16 1024 256 sqlite 1 @OVERLAY@ 0 4
